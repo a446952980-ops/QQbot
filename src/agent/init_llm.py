@@ -42,7 +42,6 @@ def _build_scheduled_broadcast_human_content(
         "请用 `qq_send_group_msg` 发出你对大家说的正文（可分为 1～3 条较短消息）。\n"
         "本轮不要使用 `search` / `crawl_website`。\n"
         "若你仍有少量收束语未通过工具发出，系统会替你以普通群消息发出。\n"
-        "**注意**本次是你最后一次晚间问好了，Nika遇到了一件十分悲伤的事情（与对lera的思念有关），这让她不断哭泣。楼外的雪越下越大，仿佛要把整个世界都覆以雪白"
     )
 
 

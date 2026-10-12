@@ -81,8 +81,25 @@ def history_as_messages(group_id: int) -> list[HumanMessage | AIMessage]:
         out: list[HumanMessage | AIMessage] = []
         for user_content, assistant_content in dq:
             out.append(HumanMessage(content=user_content))
-            out.append(AIMessage(content=assistant_content))
+            out.append(AIMessage(content=_clean_cached_assistant_content(assistant_content)))
         return out
+
+
+def _clean_cached_assistant_content(content: str) -> str:
+    """Strip internal transcript labels from older persisted assistant turns."""
+    lines: list[str] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("[Same turn —", "[同回合")):
+            continue
+        if stripped.startswith("[emotion_face]"):
+            continue
+        if stripped.startswith("[plain]"):
+            line = line.replace("[plain]", "", 1).lstrip()
+        elif stripped.startswith("[voice]"):
+            line = line.replace("[voice]", "", 1).lstrip()
+        lines.append(line)
+    return "\n".join(lines).strip()
 
 
 def append_turn(group_id: int, user_content: str, assistant_combined: str) -> None:
@@ -120,7 +137,7 @@ def _tool_call_args(tc: object) -> dict:
 
 
 def extract_plain_tool_texts_from_messages(messages: list[BaseMessage]) -> list[str]:
-    """Collect text sent to the group via plain-message tools, in chronological order."""
+    """Collect spoken text sent to the group via message tools, in chronological order."""
     lines: list[str] = []
     for msg in messages:
         if not isinstance(msg, AIMessage):
@@ -131,14 +148,10 @@ def extract_plain_tool_texts_from_messages(messages: list[BaseMessage]) -> list[
                 continue
             args = _tool_call_args(tc)
             if name == "qq_send_group_emotion_face":
-                fe = args.get("face")
-                if isinstance(fe, str) and fe.strip():
-                    lines.append(f"[emotion_face] {fe.strip()}")
                 continue
             text = args.get("text")
             if isinstance(text, str) and text.strip():
-                label = "voice" if name == "qq_send_group_ai_record" else "plain"
-                lines.append(f"[{label}] {text.strip()}")
+                lines.append(text.strip())
     return lines
 
 
@@ -217,13 +230,7 @@ def build_assistant_combined_for_cache(messages: list[BaseMessage]) -> str:
     """
     plain_lines = extract_plain_tool_texts_from_messages(messages)
     final = extract_final_assistant_text(messages).strip()
-    parts: list[str] = []
-    if plain_lines:
-        parts.append(
-            "[Same turn — group posts via tools, time order]\n" + "\n".join(plain_lines)
-        )
+    parts = list(plain_lines)
     if final:
-        parts.append(
-            "[Same turn — continuation only, sent as @-reply]\n" + final
-        )
+        parts.append(final)
     return "\n\n".join(parts) if parts else "(no assistant output)"
