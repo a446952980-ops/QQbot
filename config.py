@@ -1,4 +1,5 @@
 import dotenv
+import math
 import os
 
 dotenv.load_dotenv()
@@ -6,6 +7,13 @@ dotenv.load_dotenv()
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 WS_PORT = int(os.getenv("WS_PORT"))
 NAPCAT_WS_URL = f"{os.getenv('WS_URL').strip()}:{WS_PORT}"
+
+try:
+    WS_SEND_INTERVAL_SECONDS = float(os.getenv("WS_SEND_INTERVAL_SECONDS", "2"))
+except ValueError:
+    WS_SEND_INTERVAL_SECONDS = 2.0
+if not math.isfinite(WS_SEND_INTERVAL_SECONDS) or WS_SEND_INTERVAL_SECONDS < 0:
+    WS_SEND_INTERVAL_SECONDS = 2.0
 
 # Tavily web search API
 TAVILY_KEY = os.getenv("TAVILY_KEY")

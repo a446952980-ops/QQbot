@@ -5,6 +5,7 @@ import config
 from websockets.asyncio.client import ClientConnection
 
 from ..qq_ws_context import current_qq_websocket
+from .ws_sender import send_ws_event
 
 
 def _resolve_ws(websocket: ClientConnection | None) -> ClientConnection:
@@ -20,7 +21,8 @@ async def set_msg_emoji_like(msg_id: int, websocket: ClientConnection | None = N
     """群中向消息贴表情（随机）"""
     emoji_id_lst = [171, 75, 10024, 128147, 128522]
     ws = _resolve_ws(websocket)
-    await ws.send(
+    await send_ws_event(
+        ws,
         json.dumps(
             {
                 "action": "set_msg_emoji_like",
@@ -40,7 +42,8 @@ async def set_group_sign(
 ) -> None:
     """NapCat 群打卡（set_group_sign）。"""
     ws = _resolve_ws(websocket)
-    await ws.send(
+    await send_ws_event(
+        ws,
         json.dumps(
             {"action": "send_group_sign", "params": {"group_id": group_id}}
         )
@@ -55,7 +58,8 @@ async def send_group_msg(
     发送群聊文本消息
     """
     ws = _resolve_ws(websocket)
-    await ws.send(
+    await send_ws_event(
+        ws,
         json.dumps(
             {
                 "action": "send_group_msg",
@@ -85,7 +89,8 @@ async def send_group_ai_record(
     """Send an AI-generated voice record to a QQ group (NapCat send_group_ai_record)."""
     voice = character or config.AI_VOICE_CHARACTER
     ws = _resolve_ws(websocket)
-    await ws.send(
+    await send_ws_event(
+        ws,
         json.dumps(
             {
                 "action": "send_group_ai_record",
@@ -107,7 +112,8 @@ async def send_group_msg_reply(
     文本回复群聊指定消息
     """
     ws = _resolve_ws(websocket)
-    await ws.send(
+    await send_ws_event(
+        ws,
         json.dumps(
             {
                 "action": "send_group_msg",
@@ -143,7 +149,8 @@ async def send_group_msg_image(
 ):
     """Send a single image to a QQ group (NapCat send_group_msg image segment). `sub_type` 1 is required for expression-style images."""
     ws = _resolve_ws(websocket)
-    await ws.send(
+    await send_ws_event(
+        ws,
         json.dumps(
             {
                 "action": "send_group_msg",

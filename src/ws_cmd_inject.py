@@ -7,7 +7,8 @@ import json
 import sys
 from websockets.asyncio.client import ClientConnection
 
-_send_lock = asyncio.Lock()
+from .action.ws_sender import send_ws_event
+
 _client: ClientConnection | None = None
 
 
@@ -28,10 +29,10 @@ async def send_napcat_api_json_line(line: str) -> tuple[bool, str]:
         json.loads(s)
     except json.JSONDecodeError as e:
         return False, f"非法 JSON: {e}"
-    async with _send_lock:
-        if _client is None:
-            return False, "当前无已连接的 NapCat WebSocket"
-        await _client.send(s)
+    ws = _client
+    if ws is None:
+        return False, "当前无已连接的 NapCat WebSocket"
+    await send_ws_event(ws, s)
     return True, "已发送"
 
 
