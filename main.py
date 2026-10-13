@@ -3,6 +3,10 @@ import json
 
 from websockets.asyncio.client import connect
 
+from src.action.napcat_api import (
+    fail_pending_napcat_api_requests,
+    resolve_napcat_api_response,
+)
 from config import (
     BOT_TOKEN,
     NAPCAT_WS_URL,
@@ -31,6 +35,13 @@ async def connect_to_napcat():
             async with connect(url, additional_headers=headers) as websocket:
                 print(f"已连接到 NapCat: {NAPCAT_WS_URL}")
                 register_napcat_client_ws(websocket)
+                event_tasks: set[asyncio.Task] = set()
+
+                def _track_event_task(task: asyncio.Task) -> None:
+                    event_tasks.discard(task)
+                    if not task.cancelled() and (error := task.exception()) is not None:
+                        print(f"处理消息事件时出错: {error}")
+
                 inject_tasks: list[asyncio.Task] = []
                 if WS_STDIN_CMD:
                     inject_tasks.append(
@@ -52,12 +63,26 @@ async def connect_to_napcat():
                     async for message in websocket:
                         try:
                             event_data = json.loads(message)
-                            await handle_event(event_data, websocket)
+                            if resolve_napcat_api_response(event_data):
+                                continue
+                            if event_data.get("post_type") == "message":
+                                task = asyncio.create_task(
+                                    handle_event(event_data, websocket)
+                                )
+                                event_tasks.add(task)
+                                task.add_done_callback(_track_event_task)
+                            else:
+                                await handle_event(event_data, websocket)
                         except json.JSONDecodeError as e:
                             print(f"JSON 解析错误: {e}")
                         except Exception as e:
                             print(f"处理事件时出错: {e}")
                 finally:
+                    fail_pending_napcat_api_requests(websocket)
+                    for task in event_tasks:
+                        task.cancel()
+                    if event_tasks:
+                        await asyncio.gather(*event_tasks, return_exceptions=True)
                     for t in inject_tasks:
                         t.cancel()
                     for t in inject_tasks:

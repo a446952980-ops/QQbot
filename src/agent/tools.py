@@ -27,10 +27,17 @@ _EMOTION_FACE_TOOL_DESCRIPTION = (
 @tool
 async def qq_send_group_msg(group_id: int, text: str) -> str:
     """
-    Send a plain text message to a QQ group (not a reply to any message).
-    Default for @-replies: post in small bursts — about every 1–2 sentences per
-    call (see system prompt). Final assistant text (no tools) is only the short
-    tail sent as the @-reply. Also use for short status lines before search/crawl.
+    Send exactly one standalone plain-text message to a QQ group (not a reply).
+    Each call sends one message only; keep it to about 1–2 short sentences. For a
+    longer response, make separate calls in order instead of combining multiple
+    messages in one call.
+
+    For @-replies, the final assistant response is sent separately as the @-reply.
+    It MUST contain only new text that has not been sent by this tool: never repeat,
+    quote, concatenate, or paraphrase any text already sent in a tool message. It
+    may be a brief continuation, but if there is no genuinely new text to add, do
+    not restate the sent message. This also applies to status messages sent before
+    search/crawl.
     """
     try:
         await interaction.send_group_msg(group_id, text)
@@ -128,7 +135,7 @@ async def crawl_website(url: str, instructions: str) -> dict:
 tools_lst = [
     qq_send_group_msg,
     qq_send_group_ai_record,
-    qq_send_group_emotion_face,
+    # qq_send_group_emotion_face,
     search,
     crawl_website,
 ]

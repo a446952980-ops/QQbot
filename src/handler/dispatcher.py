@@ -12,6 +12,7 @@ async def handle_event(event_data: dict, websocket: ClientConnection):
 
     if event_data.get("post_type") == "message":
         print(f"收到消息: {event_data.get('message')}")
+        # print(f"收到消息: {json.dumps(event_data, ensure_ascii=False, indent=2)}")
         try:
             await handle_message(event_data, websocket)
         except Exception as e:

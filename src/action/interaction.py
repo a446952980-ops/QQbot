@@ -5,6 +5,7 @@ import config
 from websockets.asyncio.client import ClientConnection
 
 from ..qq_ws_context import current_qq_websocket
+from .napcat_api import request_napcat_api
 from .ws_sender import send_ws_event
 
 
@@ -15,6 +16,23 @@ def _resolve_ws(websocket: ClientConnection | None) -> ClientConnection:
     if ws is None:
         raise RuntimeError("未绑定 QQ WebSocket：请在 handle_message 入口设置 current_qq_websocket")
     return ws
+
+
+async def get_msg(message_id: int | str, websocket: ClientConnection | None = None) -> dict | None:
+    """Fetch a message by ID through NapCat's get_msg API."""
+    ws = _resolve_ws(websocket)
+    try:
+        response = await request_napcat_api(
+            ws, "get_msg", {"message_id": message_id}
+        )
+    except Exception as error:
+        print(f"查询引用消息失败 message_id={message_id}: {error}")
+        return None
+    if not response or response.get("status") != "ok" or response.get("retcode") != 0:
+        print(f"查询引用消息失败 message_id={message_id}: {response}")
+        return None
+    data = response.get("data")
+    return data if isinstance(data, dict) else None
 
 
 async def set_msg_emoji_like(msg_id: int, websocket: ClientConnection | None = None):
@@ -29,6 +47,25 @@ async def set_msg_emoji_like(msg_id: int, websocket: ClientConnection | None = N
                 "params": {
                     "message_id": msg_id,
                     "emoji_id": emoji_id_lst[random.randint(0, len(emoji_id_lst) - 1)],
+                    "set": True
+                }
+            }
+        )
+    )
+    print(f"给消息 {msg_id} 添加了表情")
+
+
+async def set_msg_emoji_like2(msg_id: int, websocket: ClientConnection | None = None):
+    """群中向消息贴表情（鲸鱼）"""
+    ws = _resolve_ws(websocket)
+    await send_ws_event(
+        ws,
+        json.dumps(
+            {
+                "action": "set_msg_emoji_like",
+                "params": {
+                    "message_id": msg_id,
+                    "emoji_id": 128051,
                     "set": True
                 }
             }

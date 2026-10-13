@@ -67,6 +67,24 @@ def _build_group_at_human_content(
     )
 
 
+def _build_multimodal_human_content(
+    text: str,
+    image_inputs: list[tuple[str, str]] | None,
+) -> str | list[dict[str, object]]:
+    if not image_inputs:
+        return text
+    content: list[dict[str, object]] = [{"type": "text", "text": text}]
+    for label, image_url in image_inputs:
+        content.append({"type": "text", "text": f"\n{label}"})
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": image_url},
+            }
+        )
+    return content
+
+
 class QQGroupAgent:
     """LangChain agent for QQ group @-mentions; `ainvoke` returns a `messages` dict like LangGraph."""
 
@@ -79,6 +97,7 @@ class QQGroupAgent:
             timeout=120,
             api_key=config.AI_KEY,
             base_url=config.AI_BASE_URL,
+            extra_body={"thinking": {"type": "disabled"}},
         )
         self.agent = create_agent(
             model=self.model,
@@ -97,18 +116,18 @@ class QQGroupAgent:
         sender_id: int,
         msg_id: int,
         text: str,
+        image_inputs: list[tuple[str, str]] | None = None,
     ) -> list[HumanMessage]:
+        user_content = _build_group_at_human_content(
+            group_id=group_id,
+            group_name=group_name,
+            sender_name=sender_name,
+            sender_id=sender_id,
+            msg_id=msg_id,
+            text=text,
+        )
         return [
-            HumanMessage(
-                content=_build_group_at_human_content(
-                    group_id=group_id,
-                    group_name=group_name,
-                    sender_name=sender_name,
-                    sender_id=sender_id,
-                    msg_id=msg_id,
-                    text=text,
-                )
-            )
+            HumanMessage(content=_build_multimodal_human_content(user_content, image_inputs))
         ]
 
     async def ainvoke_group_at(
@@ -120,6 +139,7 @@ class QQGroupAgent:
         sender_id: int,
         msg_id: int,
         text: str,
+        image_inputs: list[tuple[str, str]] | None = None,
     ) -> dict:
         """
         Returns a dict with key `messages` (list of LangChain messages), same shape as
@@ -134,15 +154,23 @@ class QQGroupAgent:
             msg_id=msg_id,
             text=text,
         )
+        multimodal_content = _build_multimodal_human_content(
+            user_content, image_inputs
+        )
+        cached_user_content = user_content
+        if image_inputs:
+            cached_user_content += "\n" + "\n".join(
+                f"{label}（图片内容未持久化）" for label, _ in image_inputs
+            )
         prior = history_as_messages(group_id)
-        messages_in = prior + [HumanMessage(content=user_content)]
+        messages_in = prior + [HumanMessage(content=multimodal_content)]
         async with self._inv_lock:
             result = await self.agent.ainvoke({"messages": messages_in})
         messages_full = result.get("messages", [])
         # Only this round (exclude re-injected history) so cache is not duplicated.
         suffix = messages_full[len(prior) :]
         assistant_combined = build_assistant_combined_for_cache(suffix)
-        append_turn(group_id, user_content, assistant_combined)
+        append_turn(group_id, cached_user_content, assistant_combined)
         return result
 
     async def ainvoke_scheduled_broadcast(
@@ -183,6 +211,7 @@ async def run_group_at_agent(
     sender_id: int,
     msg_id: int,
     text: str,
+    image_inputs: list[tuple[str, str]] | None = None,
     agent: QQGroupAgent | None = None,
 ) -> dict:
     """Convenience wrapper using `default_group_agent` unless `agent` is provided."""
@@ -194,6 +223,7 @@ async def run_group_at_agent(
         sender_id=sender_id,
         msg_id=msg_id,
         text=text,
+        image_inputs=image_inputs,
     )
 
 
