@@ -1,8 +1,12 @@
 import asyncio
+import random
 import re
 from urllib.parse import urlparse
 
+import config
+
 from ..action import interaction
+from ..agent.conversation_history import append_background_message
 from ..agent.init_llm import default_group_agent, extract_final_assistant_text
 from ..qq_ws_context import current_qq_websocket
 
@@ -124,6 +128,9 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
         sender_name = sender.get("nickname")
         sender_id = sender.get("user_id")
         msg_id = event_data.get("message_id")
+        event_time = event_data.get("time")
+        if not isinstance(event_time, int | float):
+            event_time = 0
         segments = event_data.get("message")
         if not isinstance(segments, list):
             segments = []
@@ -136,19 +143,49 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
                 text_parts.append(data["text"])
         text = "".join(text_parts)
 
+        at_info = [
+            segment.get("data", {}).get("qq")
+            for segment in segments
+            if segment.get("type") == "at" and isinstance(segment.get("data"), dict)
+        ]
+        self_id = event_data.get("self_id")
+        is_at_self = any(
+            str(at_id) == str(self_id) for at_id in at_info if at_id != "all"
+        )
+        if (
+            sender_id is not None
+            and str(sender_id) != str(self_id)
+            and random.random() < config.RANDOM_INTERJECTION_PROBABILITY
+        ):
+            try:
+                await default_group_agent.ainvoke_random_interjection(
+                    group_id=int(group_id) if group_id is not None else 0,
+                    group_name=group_name or "",
+                    sender_name=sender_name or "",
+                    sender_id=int(sender_id),
+                    msg_id=int(msg_id) if msg_id is not None else 0,
+                    text=_format_message_content(segments),
+                )
+            except Exception as error:
+                print(f"随机插话执行失败: {error}")
+        if not is_at_self:
+            display_name = sender.get("card") or sender_name or "未知群成员"
+            append_background_message(
+                int(group_id) if group_id is not None else 0,
+                int(event_time),
+                "【群聊背景消息：不是对机器人的 @ 指令】\n"
+                f"发送者: {display_name} (QQ: {sender_id or '未知'})\n"
+                f"内容: {_format_message_content(segments)}",
+            )
+
         # 群@
-        if any(segment.get("type") == "at" for segment in segments if isinstance(segment, dict)):
-            at_info = [
-                segment.get("data", {}).get("qq")
-                for segment in segments
-                if segment.get("type") == "at" and isinstance(segment.get("data"), dict)
-            ]
+        if at_info:
             print(
                 f"""【{group_name}】 [{sender_name}] @{"+".join(at_info)} {text}"""
             )
 
             # @到自己
-            if event_data.get("self_id") in [int(at_id) for at_id in at_info if at_id != "all"]:
+            if is_at_self:
                 # await interaction.set_msg_emoji_like(msg_id, websocket)
                 await interaction.set_msg_emoji_like2(msg_id, websocket)
                 reply_id = _extract_reply_message_id(
@@ -194,6 +231,7 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
                     sender_id=int(sender_id) if sender_id is not None else 0,
                     msg_id=int(msg_id) if msg_id is not None else 0,
                     text=text or "",
+                    event_time=int(event_time),
                     image_inputs=image_inputs,
                 )
                 reply_body = extract_final_assistant_text(result.get("messages", []))

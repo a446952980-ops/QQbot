@@ -35,6 +35,24 @@ async def get_msg(message_id: int | str, websocket: ClientConnection | None = No
     return data if isinstance(data, dict) else None
 
 
+async def fetch_custom_faces(
+    count: int = 48, websocket: ClientConnection | None = None
+) -> list[str]:
+    """Fetch custom-face image URLs from NapCat's fetch_custom_face API."""
+    ws = _resolve_ws(websocket)
+    response = await request_napcat_api(
+        ws, "fetch_custom_face", {"count": count}
+    )
+    if not response or response.get("status") != "ok" or response.get("retcode") != 0:
+        raise RuntimeError(
+            f"获取自定义表情失败: {response.get('message', 'NapCat 请求失败') if response else '请求超时'}"
+        )
+    data = response.get("data")
+    if not isinstance(data, list):
+        raise RuntimeError("获取自定义表情失败: NapCat 返回的数据不是列表")
+    return [url for url in data if isinstance(url, str) and url.startswith(("http://", "https://"))]
+
+
 async def set_msg_emoji_like(msg_id: int, websocket: ClientConnection | None = None):
     """群中向消息贴表情（随机）"""
     emoji_id_lst = [171, 75, 10024, 128147, 128522]

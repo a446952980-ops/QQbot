@@ -1,4 +1,4 @@
-"""Per-group last N turns (user + combined assistant); persisted under project ``data/``."""
+"""Per-group @ turns and recent non-@ group context; persisted under project ``data/``."""
 
 from __future__ import annotations
 
@@ -11,13 +11,23 @@ from pathlib import Path
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 MAX_TURNS = 8
+MAX_BACKGROUND_MESSAGES = 10
 
 _PLAIN_POST_TOOLS = frozenset(
     {"qq_send_group_msg", "qq_send_group_ai_record", "qq_send_group_emotion_face"}
 )
 
+_DSML_TOOL_CALLS_RE = re.compile(
+    r"<｜DSML｜tool_calls>.*?</｜DSML｜tool_calls>", re.DOTALL
+)
+
 _lock = threading.Lock()
-_store: dict[int, deque[tuple[str, str]]] = defaultdict(lambda: deque(maxlen=MAX_TURNS))
+_turn_store: dict[int, deque[tuple[int, str, str]]] = defaultdict(
+    lambda: deque(maxlen=MAX_TURNS)
+)
+_background_store: dict[int, deque[tuple[int, str]]] = defaultdict(
+    lambda: deque(maxlen=MAX_BACKGROUND_MESSAGES)
+)
 
 
 def _persist_paths() -> tuple[Path, Path]:
@@ -36,33 +46,56 @@ def _load_persisted() -> None:
         return
     if not isinstance(raw, dict):
         return
-    loaded: dict[int, deque[tuple[str, str]]] = {}
+    loaded_turns: dict[int, deque[tuple[int, str, str]]] = {}
+    loaded_background: dict[int, deque[tuple[int, str]]] = {}
     for key, value in raw.items():
         try:
             gid = int(key)
         except (TypeError, ValueError):
             continue
-        if not isinstance(value, list):
+        raw_turns = value.get("turns", []) if isinstance(value, dict) else value
+        raw_background = value.get("background", []) if isinstance(value, dict) else []
+        if not isinstance(raw_turns, list):
             continue
-        turns: list[tuple[str, str]] = []
-        for item in value:
-            if isinstance(item, (list, tuple)) and len(item) >= 2:
-                u, a = item[0], item[1]
-                if isinstance(u, str) and isinstance(a, str):
-                    turns.append((u, a))
+        turns: list[tuple[int, str, str]] = []
+        for index, item in enumerate(raw_turns):
+            if isinstance(item, (list, tuple)) and len(item) >= 3:
+                timestamp, user, assistant = item[0], item[1], item[2]
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                timestamp, user, assistant = index, item[0], item[1]
+            else:
+                continue
+            if isinstance(timestamp, int | float) and isinstance(user, str) and isinstance(assistant, str):
+                turns.append((int(timestamp), user, assistant))
         if turns:
-            loaded[gid] = deque(turns[-MAX_TURNS:], maxlen=MAX_TURNS)
-    for gid, dq in loaded.items():
-        _store[gid] = dq
+            loaded_turns[gid] = deque(turns[-MAX_TURNS:], maxlen=MAX_TURNS)
+        if isinstance(raw_background, list):
+            background: list[tuple[int, str]] = []
+            for item in raw_background:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    timestamp, content = item[0], item[1]
+                    if isinstance(timestamp, int | float) and isinstance(content, str):
+                        background.append((int(timestamp), content))
+            if background:
+                loaded_background[gid] = deque(
+                    background[-MAX_BACKGROUND_MESSAGES:], maxlen=MAX_BACKGROUND_MESSAGES
+                )
+    _turn_store.update(loaded_turns)
+    _background_store.update(loaded_background)
 
 
 def _save_persisted() -> None:
     data_dir, path = _persist_paths()
     data_dir.mkdir(parents=True, exist_ok=True)
-    payload: dict[str, list[list[str]]] = {}
-    for gid, dq in _store.items():
-        if dq:
-            payload[str(gid)] = [[u, a] for u, a in dq]
+    payload: dict[str, dict[str, list[list[object]]]] = {}
+    for gid in set(_turn_store) | set(_background_store):
+        turns = _turn_store.get(gid)
+        background = _background_store.get(gid)
+        if turns or background:
+            payload[str(gid)] = {
+                "turns": [[timestamp, user, assistant] for timestamp, user, assistant in turns or ()],
+                "background": [[timestamp, content] for timestamp, content in background or ()],
+            }
     text = json.dumps(payload, ensure_ascii=False, indent=2)
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(text, encoding="utf-8")
@@ -73,20 +106,26 @@ _load_persisted()
 
 
 def history_as_messages(group_id: int) -> list[HumanMessage | AIMessage]:
-    """Prior turns as alternating HumanMessage / AIMessage for agent context."""
+    """Replay @ turns and up to 10 non-@ group messages in event-time order."""
     with _lock:
-        dq = _store.get(group_id)
-        if not dq:
+        turns = _turn_store.get(group_id)
+        background = _background_store.get(group_id)
+        if not turns and not background:
             return []
-        out: list[HumanMessage | AIMessage] = []
-        for user_content, assistant_content in dq:
-            out.append(HumanMessage(content=user_content))
-            out.append(AIMessage(content=_clean_cached_assistant_content(assistant_content)))
-        return out
+        events: list[tuple[int, int, BaseMessage]] = []
+        for timestamp, content in background or ():
+            events.append((timestamp, 0, HumanMessage(content=content)))
+        for timestamp, user_content, assistant_content in turns or ():
+            events.append((timestamp, 1, HumanMessage(content=user_content)))
+            events.append(
+                (timestamp, 2, AIMessage(content=_clean_cached_assistant_content(assistant_content)))
+            )
+        return [message for _, _, message in sorted(events, key=lambda item: item[:2])]
 
 
 def _clean_cached_assistant_content(content: str) -> str:
     """Strip internal transcript labels from older persisted assistant turns."""
+    content = _DSML_TOOL_CALLS_RE.sub("", content)
     lines: list[str] = []
     for line in content.splitlines():
         stripped = line.strip()
@@ -102,9 +141,21 @@ def _clean_cached_assistant_content(content: str) -> str:
     return "\n".join(lines).strip()
 
 
-def append_turn(group_id: int, user_content: str, assistant_combined: str) -> None:
+def append_turn(
+    group_id: int, timestamp: int, user_content: str, assistant_combined: str
+) -> None:
     with _lock:
-        _store[group_id].append((user_content, assistant_combined))
+        _turn_store[group_id].append((timestamp, user_content, assistant_combined))
+        try:
+            _save_persisted()
+        except OSError:
+            pass
+
+
+def append_background_message(group_id: int, timestamp: int, content: str) -> None:
+    """Store a non-@ group message as model context without treating it as a command."""
+    with _lock:
+        _background_store[group_id].append((timestamp, content))
         try:
             _save_persisted()
         except OSError:
@@ -159,7 +210,7 @@ def strip_markdown_for_qq(text: str) -> str:
     """Remove common Markdown so final replies are plain text in QQ."""
     if not text or not text.strip():
         return text
-    t = text
+    t = _DSML_TOOL_CALLS_RE.sub("", text)
     t = re.sub(r"```[\s\S]*?```", "", t)
     t = re.sub(r"`([^`]+)`", r"\1", t)
     t = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", t)

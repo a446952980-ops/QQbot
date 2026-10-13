@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Literal
 
 from langchain.agents import create_agent
+from langchain.agents.middleware import ToolCallLimitMiddleware
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 from langchain.messages import SystemMessage
@@ -14,9 +15,15 @@ from .conversation_history import (
     extract_final_assistant_text,
     history_as_messages,
 )
-from .tools import tools_lst
+from .tools import interjection_tools_lst, tools_lst
 
 from .system_prompt import sys_prompt
+
+_RANDOM_INTERJECTION_PROMPT = """
+这是一次随机群聊插话。必须执行 1 或 2 次工具调用，然后结束：只能使用可见的群发送工具。
+`qq_send_group_emotion_face2` 最多调用一次。工具调用才会发送到群里；你的最终文本不会被发送，
+也不会存储到对话上下文，所以不要在最终文本中写任何消息内容。不要使用搜索或网页抓取。
+"""
 
 
 def _build_scheduled_broadcast_human_content(
@@ -106,6 +113,44 @@ class QQGroupAgent:
                 content=[{"type": "text", "text": sys_prompt}]
             ),
         )
+        self.interjection_agent = create_agent(
+            model=self.model,
+            tools=interjection_tools_lst,
+            middleware=[ToolCallLimitMiddleware(run_limit=2)],
+            system_prompt=SystemMessage(
+                content=[
+                    {
+                        "type": "text",
+                        "text": sys_prompt + "\n" + _RANDOM_INTERJECTION_PROMPT,
+                    }
+                ]
+            ),
+        )
+
+    async def ainvoke_random_interjection(
+        self,
+        *,
+        group_id: int,
+        group_name: str,
+        sender_name: str,
+        sender_id: int,
+        msg_id: int,
+        text: str,
+    ) -> None:
+        """Run a tool-only random interjection without reading or writing history."""
+        content = (
+            "Random interjection context (use real IDs in tools):\n"
+            f"- group_id: {group_id}\n"
+            f"- group_name: {group_name}\n"
+            f"- sender_name: {sender_name}\n"
+            f"- sender_id: {sender_id}\n"
+            f"- msg_id: {msg_id}\n"
+            f"- latest_group_message: {text}\n"
+        )
+        async with self._inv_lock:
+            await self.interjection_agent.ainvoke(
+                {"messages": [HumanMessage(content=content)]}
+            )
 
     def build_messages_for_group_at(
         self,
@@ -139,6 +184,7 @@ class QQGroupAgent:
         sender_id: int,
         msg_id: int,
         text: str,
+        event_time: int | None = None,
         image_inputs: list[tuple[str, str]] | None = None,
     ) -> dict:
         """
@@ -170,7 +216,12 @@ class QQGroupAgent:
         # Only this round (exclude re-injected history) so cache is not duplicated.
         suffix = messages_full[len(prior) :]
         assistant_combined = build_assistant_combined_for_cache(suffix)
-        append_turn(group_id, cached_user_content, assistant_combined)
+        append_turn(
+            group_id,
+            event_time if event_time is not None else int(datetime.now().timestamp()),
+            cached_user_content,
+            assistant_combined,
+        )
         return result
 
     async def ainvoke_scheduled_broadcast(
@@ -196,7 +247,12 @@ class QQGroupAgent:
         messages_full = result.get("messages", [])
         suffix = messages_full[len(prior) :]
         assistant_combined = build_assistant_combined_for_cache(suffix)
-        append_turn(group_id, user_content, assistant_combined)
+        append_turn(
+            group_id,
+            int(datetime.now().timestamp()),
+            user_content,
+            assistant_combined,
+        )
         return result
 
 
@@ -211,6 +267,7 @@ async def run_group_at_agent(
     sender_id: int,
     msg_id: int,
     text: str,
+    event_time: int | None = None,
     image_inputs: list[tuple[str, str]] | None = None,
     agent: QQGroupAgent | None = None,
 ) -> dict:
@@ -223,6 +280,7 @@ async def run_group_at_agent(
         sender_id=sender_id,
         msg_id=msg_id,
         text=text,
+        event_time=event_time,
         image_inputs=image_inputs,
     )
 

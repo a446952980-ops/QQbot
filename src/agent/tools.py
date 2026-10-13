@@ -1,4 +1,7 @@
 from typing import Literal, Sequence
+from urllib.parse import unquote, urlparse
+from pathlib import PurePosixPath
+import random
 
 from langchain.tools import tool
 import config
@@ -27,17 +30,9 @@ _EMOTION_FACE_TOOL_DESCRIPTION = (
 @tool
 async def qq_send_group_msg(group_id: int, text: str) -> str:
     """
-    Send exactly one standalone plain-text message to a QQ group (not a reply).
-    Each call sends one message only; keep it to about 1–2 short sentences. For a
-    longer response, make separate calls in order instead of combining multiple
-    messages in one call.
-
-    For @-replies, the final assistant response is sent separately as the @-reply.
-    It MUST contain only new text that has not been sent by this tool: never repeat,
-    quote, concatenate, or paraphrase any text already sent in a tool message. It
-    may be a brief continuation, but if there is no genuinely new text to add, do
-    not restate the sent message. This also applies to status messages sent before
-    search/crawl.
+    Send exactly one standalone plain-text message to a QQ group (not a reply). This tool is strictly for pre-final messages, never for sending the final answer or its正文.
+    When preparing a long response, you MUST send its preceding sentences or paragraphs through separate tool calls, in their intended order, leaving only the final sentence or paragraph to be delivered directly by the model's final response. Never send the final paragraph through this tool.
+    Each call sends one message of 1–2 short sentences. For @-replies, the final response MUST contain only new text; never repeat, quote, concatenate, or paraphrase anything already sent through this tool. The same rule applies to pre-search/crawl status messages.
     """
     try:
         await interaction.send_group_msg(group_id, text)
@@ -76,6 +71,23 @@ async def qq_send_group_emotion_face(group_id: int, face: str) -> str:
     except RuntimeError as e:
         return f"Failed: {e}"
     return f"Emotion face {fname} sent."
+
+
+@tool
+async def qq_send_group_emotion_face2(group_id: int) -> str:
+    """Send one randomly selected custom QQ face fetched live from NapCat."""
+    try:
+        faces = await interaction.fetch_custom_faces(count=48)
+        if not faces:
+            return "Failed: NapCat returned no custom faces."
+        url = random.choice(faces)
+        filename = PurePosixPath(unquote(urlparse(url).path)).name or "custom_face.png"
+        await interaction.send_group_msg_image(
+            group_id, filename, url, sub_type=1
+        )
+    except RuntimeError as e:
+        return f"Failed: {e}"
+    return f"Custom emotion face {filename} sent."
 
 
 @tool
@@ -135,7 +147,14 @@ async def crawl_website(url: str, instructions: str) -> dict:
 tools_lst = [
     qq_send_group_msg,
     qq_send_group_ai_record,
-    # qq_send_group_emotion_face,
+    qq_send_group_emotion_face2,
     search,
     crawl_website,
+]
+
+# Random interjections only need tools that visibly post to the group.
+interjection_tools_lst = [
+    qq_send_group_msg,
+    qq_send_group_ai_record,
+    qq_send_group_emotion_face2,
 ]
