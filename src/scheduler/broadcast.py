@@ -11,6 +11,7 @@ from websockets.asyncio.client import ClientConnection
 
 from ..action import interaction
 from ..agent.init_llm import default_group_agent, extract_final_assistant_text
+from ..handler.commands import is_group_enabled
 from ..qq_ws_context import current_qq_websocket
 
 
@@ -39,6 +40,8 @@ async def run_scheduled_broadcast(
     token = current_qq_websocket.set(websocket)
     try:
         for gid in config.PROACTIVE_GROUP_IDS:
+            if not is_group_enabled(gid):
+                continue  # 该群已被管理员 /shutdown
             try:
                 await _run_broadcast_for_group(websocket, group_id=gid, slot=slot)
             except Exception as e:
@@ -54,6 +57,8 @@ async def run_daily_group_sign(websocket: ClientConnection) -> None:
     token = current_qq_websocket.set(websocket)
     try:
         for gid in config.PROACTIVE_GROUP_IDS:
+            if not is_group_enabled(gid):
+                continue  # 该群已被管理员 /shutdown
             try:
                 await interaction.set_group_sign(gid, websocket)
             except Exception as e:

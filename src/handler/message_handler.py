@@ -9,6 +9,7 @@ from ..action import interaction
 from ..agent.conversation_history import append_background_message
 from ..agent.init_llm import default_group_agent, extract_final_assistant_text
 from ..qq_ws_context import current_qq_websocket
+from .commands import is_group_enabled, try_handle_group_command
 
 from websockets.asyncio.client import ClientConnection
 
@@ -143,6 +144,20 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
                 text_parts.append(data["text"])
         text = "".join(text_parts)
 
+        # 群内 “/” 指令（完全匹配）：命中即执行并结束本条消息的处理
+        if await try_handle_group_command(
+            text,
+            group_id=int(group_id) if group_id is not None else 0,
+            websocket=websocket,
+            sender_id=sender_id,
+        ):
+            return
+
+        # 本群已被管理员 /shutdown：仅记录日志，不做任何处理（/startup 仍可用）
+        if not is_group_enabled(int(group_id) if group_id is not None else 0):
+            print(f"【{group_name}】[已关闭] [{sender_name}] {text}")
+            return
+
         at_info = [
             segment.get("data", {}).get("qq")
             for segment in segments
@@ -165,6 +180,7 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
                     sender_id=int(sender_id),
                     msg_id=int(msg_id) if msg_id is not None else 0,
                     text=_format_message_content(segments),
+                    image_inputs=_extract_image_urls(segments, "当前消息中的图片"),
                 )
             except Exception as error:
                 print(f"随机插话执行失败: {error}")

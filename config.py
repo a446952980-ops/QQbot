@@ -29,23 +29,32 @@ RANDOM_INTERJECTION_PROBABILITY = min(max(RANDOM_INTERJECTION_PROBABILITY, 0.0),
 TAVILY_KEY = os.getenv("TAVILY_KEY")
 
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL")
+VISION_MODEL = os.getenv("VISION_MODEL")
 AI_KEY = os.getenv("AI_KEY")
 AI_BASE_URL = os.getenv("AI_BASE_URL")
 
 # NapCat send_group_ai_record voice character id (override via AI_VOICE_CHARACTER)
 AI_VOICE_CHARACTER = (os.getenv("AI_VOICE_CHARACTER") or "lucy-voice-female1").strip()
 
+
+def _parse_int_list(raw: str) -> list[int]:
+    ids: list[int] = []
+    for part in raw.replace(";", ",").split(","):
+        _p = part.strip()
+        if not _p:
+            continue
+        try:
+            ids.append(int(_p))
+        except ValueError:
+            pass
+    return ids
+
+
 # Comma- or semicolon-separated QQ group ids for scheduled proactive messages (08:00 / 19:00 local)
-_proactive_raw = (os.getenv("PROACTIVE_GROUP_IDS") or "").strip()
-PROACTIVE_GROUP_IDS: list[int] = []
-for _part in _proactive_raw.replace(";", ",").split(","):
-    _p = _part.strip()
-    if not _p:
-        continue
-    try:
-        PROACTIVE_GROUP_IDS.append(int(_p))
-    except ValueError:
-        pass
+PROACTIVE_GROUP_IDS: list[int] = _parse_int_list((os.getenv("PROACTIVE_GROUP_IDS") or "").strip())
+
+# 管理员 QQ 账号（逗号或分号分隔），可执行 /shutdown、/startup 等管理员指令
+ADMIN_QQ_IDS: list[int] = _parse_int_list((os.getenv("ADMIN_QQ_IDS") or "").strip())
 
 
 def _parse_ws_cmd_tcp_bind(s: str) -> tuple[str, int] | None:

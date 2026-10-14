@@ -15,11 +15,11 @@ from .conversation_history import (
     extract_final_assistant_text,
     history_as_messages,
 )
+from .group_prompt import get_active_prompt_name, get_prompt_text
 from .tools import interjection_tools_lst, tools_lst
 
-from .system_prompt import sys_prompt
-
 _RANDOM_INTERJECTION_PROMPT = """
+现在没有任何人专门对你说话，只是群友们在自己闲聊，所以不要以对方在向自己说话的方式回复，而是要结合历史信息发送结合当前情境下适当的消息。
 这是一次随机群聊插话。必须执行 1 或 2 次工具调用，然后结束：只能使用可见的群发送工具。
 `qq_send_group_emotion_face2` 最多调用一次。工具调用才会发送到群里；你的最终文本不会被发送，
 也不会存储到对话上下文，所以不要在最终文本中写任何消息内容。不要使用搜索或网页抓取。
@@ -106,26 +106,58 @@ class QQGroupAgent:
             base_url=config.AI_BASE_URL,
             extra_body={"thinking": {"type": "disabled"}},
         )
-        self.agent = create_agent(
-            model=self.model,
-            tools=tools_lst,
-            system_prompt=SystemMessage(
-                content=[{"type": "text", "text": sys_prompt}]
-            ),
+        # 仅在消息携带图片时使用；未配置 VISION_MODEL 时退回默认模型
+        self.vision_model = ChatOpenAI(
+            model=config.VISION_MODEL or config.DEFAULT_MODEL,
+            temperature=0.1,
+            max_tokens=4096,
+            timeout=120,
+            api_key=config.AI_KEY,
+            base_url=config.AI_BASE_URL,
+            extra_body={"thinking": {"type": "disabled"}},
         )
-        self.interjection_agent = create_agent(
-            model=self.model,
-            tools=interjection_tools_lst,
-            middleware=[ToolCallLimitMiddleware(run_limit=2)],
-            system_prompt=SystemMessage(
-                content=[
-                    {
-                        "type": "text",
-                        "text": sys_prompt + "\n" + _RANDOM_INTERJECTION_PROMPT,
-                    }
-                ]
-            ),
-        )
+        # (提示词变量名, 用途) -> agent 实例；按 (群当前提示词, 是否视觉/是否插话) 懒创建并缓存
+        self._agent_cache: dict[tuple[str, str], object] = {}
+
+    def _get_chat_agent(self, prompt_var_name: str, *, vision: bool):
+        """普通 @ 回复 / 定时群发 agent；vision=True 时用视觉模型。"""
+        key = (prompt_var_name, "chat_vision" if vision else "chat")
+        agent = self._agent_cache.get(key)
+        if agent is None:
+            agent = create_agent(
+                model=self.vision_model if vision else self.model,
+                tools=tools_lst,
+                system_prompt=SystemMessage(
+                    content=[
+                        {"type": "text", "text": get_prompt_text(prompt_var_name)}
+                    ]
+                ),
+            )
+            self._agent_cache[key] = agent
+        return agent
+
+    def _get_interjection_agent(self, prompt_var_name: str, *, vision: bool):
+        """随机插话 agent（工具调用次数受限）；vision=True 时用视觉模型。"""
+        key = (prompt_var_name, "interject_vision" if vision else "interject")
+        agent = self._agent_cache.get(key)
+        if agent is None:
+            agent = create_agent(
+                model=self.vision_model if vision else self.model,
+                tools=interjection_tools_lst,
+                middleware=[ToolCallLimitMiddleware(run_limit=2)],
+                system_prompt=SystemMessage(
+                    content=[
+                        {
+                            "type": "text",
+                            "text": get_prompt_text(prompt_var_name)
+                            + "\n"
+                            + _RANDOM_INTERJECTION_PROMPT,
+                        }
+                    ]
+                ),
+            )
+            self._agent_cache[key] = agent
+        return agent
 
     async def ainvoke_random_interjection(
         self,
@@ -136,6 +168,7 @@ class QQGroupAgent:
         sender_id: int,
         msg_id: int,
         text: str,
+        image_inputs: list[tuple[str, str]] | None = None,
     ) -> None:
         """Run a tool-only random interjection without reading or writing history."""
         content = (
@@ -147,9 +180,18 @@ class QQGroupAgent:
             f"- msg_id: {msg_id}\n"
             f"- latest_group_message: {text}\n"
         )
+        agent = self._get_interjection_agent(
+            get_active_prompt_name(group_id), vision=bool(image_inputs)
+        )
         async with self._inv_lock:
-            await self.interjection_agent.ainvoke(
-                {"messages": [HumanMessage(content=content)]}
+            await agent.ainvoke(
+                {
+                    "messages": [
+                        HumanMessage(
+                            content=_build_multimodal_human_content(content, image_inputs)
+                        )
+                    ]
+                }
             )
 
     def build_messages_for_group_at(
@@ -210,8 +252,11 @@ class QQGroupAgent:
             )
         prior = history_as_messages(group_id)
         messages_in = prior + [HumanMessage(content=multimodal_content)]
+        agent = self._get_chat_agent(
+            get_active_prompt_name(group_id), vision=bool(image_inputs)
+        )
         async with self._inv_lock:
-            result = await self.agent.ainvoke({"messages": messages_in})
+            result = await agent.ainvoke({"messages": messages_in})
         messages_full = result.get("messages", [])
         # Only this round (exclude re-injected history) so cache is not duplicated.
         suffix = messages_full[len(prior) :]
@@ -242,8 +287,9 @@ class QQGroupAgent:
         )
         prior = history_as_messages(group_id)
         messages_in = prior + [HumanMessage(content=user_content)]
+        agent = self._get_chat_agent(get_active_prompt_name(group_id), vision=False)
         async with self._inv_lock:
-            result = await self.agent.ainvoke({"messages": messages_in})
+            result = await agent.ainvoke({"messages": messages_in})
         messages_full = result.get("messages", [])
         suffix = messages_full[len(prior) :]
         assistant_combined = build_assistant_combined_for_cache(suffix)
