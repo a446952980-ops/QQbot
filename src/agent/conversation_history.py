@@ -152,6 +152,35 @@ def append_turn(
             pass
 
 
+def clear_group_turns(group_id: int) -> None:
+    """清空该群的 @ 轮次上下文，保留 background（供 mode 切换类指令使用）。"""
+    with _lock:
+        turns = _turn_store.get(group_id)
+        if turns:
+            turns.clear()
+            try:
+                _save_persisted()
+            except OSError:
+                pass
+
+
+def clear_group_all(group_id: int) -> None:
+    """清空该群全部上下文（turns + background）。"""
+    with _lock:
+        turns = _turn_store.get(group_id)
+        background = _background_store.get(group_id)
+        if not turns and not background:
+            return
+        if turns:
+            turns.clear()
+        if background:
+            background.clear()
+        try:
+            _save_persisted()
+        except OSError:
+            pass
+
+
 def append_background_message(group_id: int, timestamp: int, content: str) -> None:
     """Store a non-@ group message as model context without treating it as a command."""
     with _lock:

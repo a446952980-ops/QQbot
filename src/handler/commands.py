@@ -5,6 +5,9 @@
 2. 写一个处理函数 `async def _handle_xxx(arg, *, group_id, websocket) -> bool`
    （arg 为第二个空格分隔的参数，无参数时为 None；参数不合法返回 False 表示不触发）；
 3. 在 _COMMAND_HANDLERS 中登记（管理员指令需同时加入 _ADMIN_COMMANDS）。
+
+mode 切换类指令（_MODE_COMMANDS）额外支持可选参数 `--empty`：
+切换或重置时清空该群除 background 外的上下文（处理函数需接受 empty 关键字参数）。
 """
 
 from collections.abc import Awaitable, Callable
@@ -14,9 +17,9 @@ import config
 from websockets.asyncio.client import ClientConnection
 
 from ..action import interaction
-from ..agent import group_prompt
+from ..agent import conversation_history, group_prompt
 
-SECRET_MODE_DEFAULT_MINUTES = 10
+TIMED_MODE_DEFAULT_MINUTES = 10
 
 
 # ---- 群级服务开关（/shutdown 关闭、/startup 恢复；服务重启后默认全部开启） ----
@@ -39,45 +42,97 @@ class GroupCommand(str, Enum):
     """群聊指令；成员值即触发的消息文本（完全匹配，大小写敏感）。"""
 
     SECRET_MODE = "/secret_mode"
+    SMART_MODE = "/smart_mode"
     MODE_RESET = "/mode_reset"
+    EMPTY = "/empty"
     SHUTDOWN = "/shutdown"
     STARTUP = "/startup"
 
 
-async def _handle_secret_mode(
-    arg: str | None, *, group_id: int, websocket: ClientConnection
-) -> bool:
-    """/secret_mode、/secret_mode -N（N 为正整数分钟）、/secret_mode -forever"""
+def _apply_timed_mode(
+    group_id: int, prompt_var_name: str, arg: str | None
+) -> str | None:
+    """定时模式共用的参数解析与提示词切换。
+
+    无参数 = 默认 10 分钟；`-N` = N 分钟（N 为正整数）；`-forever` = 本次服务启动期间持久。
+    返回生效时长描述；参数不合法返回 None（调用方视为不触发）。
+    """
     minutes: int | None  # None 表示 -forever（服务运行期间持久）
     if arg is None:
-        minutes = SECRET_MODE_DEFAULT_MINUTES
+        minutes = TIMED_MODE_DEFAULT_MINUTES
     elif arg == "-forever":
         minutes = None
     elif arg.startswith("-") and arg[1:].isdigit() and int(arg[1:]) > 0:
         minutes = int(arg[1:])
     else:
+        return None
+    group_prompt.set_group_prompt(
+        group_id, prompt_var_name, None if minutes is None else minutes * 60
+    )
+    return "Unlimited" if minutes is None else f"{minutes} 分钟"
+
+
+async def _handle_secret_mode(
+    arg: str | None, *, group_id: int, websocket: ClientConnection, empty: bool = False
+) -> bool:
+    """/secret_mode [-N | -forever] [--empty]：N 为正整数分钟"""
+    duration_desc = _apply_timed_mode(group_id, "secret_mode_prompt", arg)
+    if duration_desc is None:
         return False  # 传参错误：不触发，按普通消息处理
-    if minutes is None:
-        group_prompt.set_group_prompt(group_id, "secret_mode_prompt", None)
-        duration_desc = ""
-    else:
-        group_prompt.set_group_prompt(group_id, "secret_mode_prompt", minutes * 60)
-        duration_desc = f"{minutes} 分钟"
+    if empty:
+        conversation_history.clear_group_turns(group_id)
+    suffix = "，上下文已清空" if empty else ""
     await interaction.send_group_msg(
-        group_id, f"secret_mode 已在本群开启（{duration_desc}）", websocket
+        group_id, f"secret_mode 已在本群开启（{duration_desc}）{suffix}", websocket
+    )
+    return True
+
+
+async def _handle_smart_mode(
+    arg: str | None, *, group_id: int, websocket: ClientConnection, empty: bool = False
+) -> bool:
+    """/smart_mode [-N | -forever] [--empty]：生效时间逻辑同 /secret_mode"""
+    duration_desc = _apply_timed_mode(group_id, "smart_mode_prompt", arg)
+    if duration_desc is None:
+        return False  # 传参错误：不触发，按普通消息处理
+    if empty:
+        conversation_history.clear_group_turns(group_id)
+    suffix = "，上下文已清空" if empty else ""
+    await interaction.send_group_msg(
+        group_id, f"smart_mode 已在本群开启（{duration_desc}）{suffix}", websocket
     )
     return True
 
 
 async def _handle_mode_reset(
+    arg: str | None, *, group_id: int, websocket: ClientConnection, empty: bool = False
+) -> bool:
+    """/mode_reset [--empty]：恢复本群默认 sys_prompt"""
+    if arg is not None:
+        return False  # 除 --empty 外带参数都不触发
+    group_prompt.reset_group_prompt(group_id)
+    if empty:
+        conversation_history.clear_group_turns(group_id)
+    suffix = "，上下文已清空" if empty else ""
+    await interaction.send_group_msg(group_id, f"本群已恢复默认模式{suffix}", websocket)
+    return True
+
+
+async def _handle_empty(
     arg: str | None, *, group_id: int, websocket: ClientConnection
 ) -> bool:
-    """/mode_reset：不接收参数，恢复本群默认 sys_prompt"""
-    if arg is not None:
-        return False  # 带了任何参数都不触发
-    group_prompt.reset_group_prompt(group_id)
-    await interaction.send_group_msg(group_id, "本群已恢复默认模式", websocket)
-    return True
+    """/empty：清空该群除 background 外的上下文；/empty -a：清空该群全部上下文"""
+    if arg is None:
+        conversation_history.clear_group_turns(group_id)
+        await interaction.send_group_msg(
+            group_id, "本群上下文已清空（background 保留）", websocket
+        )
+        return True
+    if arg == "-a":
+        conversation_history.clear_group_all(group_id)
+        await interaction.send_group_msg(group_id, "本群全部上下文已清空", websocket)
+        return True
+    return False  # 传参错误：不触发，按普通消息处理
 
 
 async def _handle_shutdown(
@@ -106,13 +161,22 @@ async def _handle_startup(
 
 _COMMAND_HANDLERS: dict[GroupCommand, Callable[..., Awaitable[bool]]] = {
     GroupCommand.SECRET_MODE: _handle_secret_mode,
+    GroupCommand.SMART_MODE: _handle_smart_mode,
     GroupCommand.MODE_RESET: _handle_mode_reset,
+    GroupCommand.EMPTY: _handle_empty,
     GroupCommand.SHUTDOWN: _handle_shutdown,
     GroupCommand.STARTUP: _handle_startup,
 }
 
 # 仅管理员（config.ADMIN_QQ_IDS）可触发的指令
 _ADMIN_COMMANDS: set[GroupCommand] = {GroupCommand.SHUTDOWN, GroupCommand.STARTUP}
+
+# mode 切换类指令：额外支持可选参数 --empty（切换/重置时清空该群除 background 外的上下文）
+_MODE_COMMANDS: set[GroupCommand] = {
+    GroupCommand.SECRET_MODE,
+    GroupCommand.SMART_MODE,
+    GroupCommand.MODE_RESET,
+}
 
 
 async def try_handle_group_command(
@@ -127,7 +191,7 @@ async def try_handle_group_command(
     if not stripped.startswith("/"):
         return False
     tokens = stripped.split()
-    if len(tokens) > 2:  # 至多 “指令 + 一个参数”，多余 token 一律不触发
+    if len(tokens) > 3:  # 至多 “指令 + 参数 + --empty”，多余 token 一律不触发
         return False
     try:
         command = GroupCommand(tokens[0])
@@ -140,5 +204,20 @@ async def try_handle_group_command(
             is_admin = False
         if not is_admin:
             return False  # 非管理员不触发，按普通消息处理
-    arg = tokens[1] if len(tokens) == 2 else None
+    empty = False
+    rest = tokens[1:]
+    if "--empty" in rest:
+        if rest.count("--empty") > 1:
+            return False  # --empty 至多出现一次
+        empty = True
+        rest = [token for token in rest if token != "--empty"]
+    if len(rest) > 1:
+        return False
+    arg = rest[0] if rest else None
+    if empty and command not in _MODE_COMMANDS:
+        return False  # --empty 仅 mode 切换类指令支持
+    if command in _MODE_COMMANDS:
+        return await _COMMAND_HANDLERS[command](
+            arg, group_id=group_id, websocket=websocket, empty=empty
+        )
     return await _COMMAND_HANDLERS[command](arg, group_id=group_id, websocket=websocket)

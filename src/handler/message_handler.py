@@ -13,6 +13,13 @@ from .commands import is_group_enabled, try_handle_group_command
 
 from websockets.asyncio.client import ClientConnection
 
+# 模型输出被上游内容过滤时，兼容层会抛 'str' object has no attribute 'model_dump'
+_FILTERED_REPLY_TEXT = "【filtered】"
+
+
+def _is_filtered_content_error(error: Exception) -> bool:
+    return "model_dump" in str(error)
+
 
 def _extract_reply_message_id(segments: list, raw_message: str) -> str | None:
     for segment in segments:
@@ -184,6 +191,12 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
                 )
             except Exception as error:
                 print(f"随机插话执行失败: {error}")
+                if _is_filtered_content_error(error):
+                    await interaction.send_group_msg(
+                        int(group_id) if group_id is not None else 0,
+                        _FILTERED_REPLY_TEXT,
+                        websocket,
+                    )
         if not is_at_self:
             display_name = sender.get("card") or sender_name or "未知群成员"
             append_background_message(
@@ -240,16 +253,24 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
                 image_inputs.extend(
                     _extract_image_urls(segments, "当前消息中的图片")
                 )
-                result = await default_group_agent.ainvoke_group_at(
-                    group_id=group_id,
-                    group_name=group_name or "",
-                    sender_name=sender_name or "",
-                    sender_id=int(sender_id) if sender_id is not None else 0,
-                    msg_id=int(msg_id) if msg_id is not None else 0,
-                    text=text or "",
-                    event_time=int(event_time),
-                    image_inputs=image_inputs,
-                )
+                try:
+                    result = await default_group_agent.ainvoke_group_at(
+                        group_id=group_id,
+                        group_name=group_name or "",
+                        sender_name=sender_name or "",
+                        sender_id=int(sender_id) if sender_id is not None else 0,
+                        msg_id=int(msg_id) if msg_id is not None else 0,
+                        text=text or "",
+                        event_time=int(event_time),
+                        image_inputs=image_inputs,
+                    )
+                except Exception as error:
+                    if not _is_filtered_content_error(error):
+                        raise
+                    await interaction.send_group_msg_reply(
+                        group_id, msg_id, _FILTERED_REPLY_TEXT, websocket
+                    )
+                    return
                 reply_body = extract_final_assistant_text(result.get("messages", []))
                 if reply_body:
                     await asyncio.sleep(2)
