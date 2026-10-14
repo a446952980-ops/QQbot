@@ -237,9 +237,18 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
                 reply_body = extract_final_assistant_text(result.get("messages", []))
                 if reply_body:
                     await asyncio.sleep(2)
-                    await interaction.send_group_msg_reply(
-                        group_id, msg_id, reply_body, websocket
-                    )
+                    segments = interaction.split_message_segments(reply_body)
+                    if len(segments) <= 1:
+                        await interaction.send_group_msg_reply(
+                            group_id, msg_id, reply_body, websocket
+                        )
+                    else:
+                        # 换行分段：前面的段落走普通群消息按序排队发送，最后一段作为带 @ 的回复
+                        for seg in segments[:-1]:
+                            await interaction.send_group_msg(group_id, seg, websocket)
+                        await interaction.send_group_msg_reply(
+                            group_id, msg_id, segments[-1], websocket
+                        )
 
         # await websocket.send(
         #     json.dumps(

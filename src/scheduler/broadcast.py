@@ -26,8 +26,8 @@ async def _run_broadcast_for_group(
         slot=slot,
     )
     body = extract_final_assistant_text(result.get("messages", []))
-    if body.strip():
-        await interaction.send_group_msg(group_id, body, websocket)
+    for segment in interaction.split_message_segments(body):
+        await interaction.send_group_msg(group_id, segment, websocket)
 
 
 async def run_scheduled_broadcast(

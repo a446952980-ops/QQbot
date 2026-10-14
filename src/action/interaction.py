@@ -1,5 +1,6 @@
 import json
 import random
+import re
 
 import config
 from websockets.asyncio.client import ClientConnection
@@ -16,6 +17,11 @@ def _resolve_ws(websocket: ClientConnection | None) -> ClientConnection:
     if ws is None:
         raise RuntimeError("未绑定 QQ WebSocket：请在 handle_message 入口设置 current_qq_websocket")
     return ws
+
+
+def split_message_segments(text: str) -> list[str]:
+    """按单/多换行把文本拆成非空段落，供分段排队发送。"""
+    return [seg.strip() for seg in re.split(r"\n+", text) if seg.strip()]
 
 
 async def get_msg(message_id: int | str, websocket: ClientConnection | None = None) -> dict | None:
