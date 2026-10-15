@@ -1,11 +1,14 @@
 from typing import Literal, Sequence
 from urllib.parse import unquote, urlparse
 from pathlib import PurePosixPath
+from datetime import datetime
+import json
 import random
 
 from langchain.tools import tool
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
+import httpx
 import config
 from tavily import AsyncTavilyClient
 from ..action import interaction
@@ -109,7 +112,8 @@ async def qq_send_group_emotion_face2(group_id: int) -> str:
 async def qq_send_group_msg_image(group_id: int, url: str) -> str:
     """
     根据已知的图片 URL 直接发送图片到群聊。
-    常用于群友要求找图时：先结合 search / crawl_website 联网检索拿到相关图片的 URL，
+    常用于群友要求找图时：先结合 search / search_images / crawl_website /
+    scrape_website 联网检索拿到相关图片的 URL（可用 analyze_images 先确认内容），
     再用本工具把找到的图片直接发到群里。url 必须是可公网访问的 http(s) 图片直链。
     """
     try:
@@ -125,8 +129,9 @@ async def analyze_images(urls: list[str], prompt: str | None = None) -> str:
     识别一张或多张图片（传入图片 URL），由 VISION_MODEL 分析后返回文字描述。
     默认提示词为「描述图片内容」；需要特定识别目标（如提取图中文字、辨认物体/人物、
     结合联网搜索结果判断图片出处等）时可用 prompt 自定义。
-    适用场景：群里给出图片链接，或 search / crawl_website 联网检索得到图片 URL
-    后需要了解图片内容时。仅返回文字描述，不会发送任何内容到群聊。
+    适用场景：群里给出图片链接，或 search / search_images / crawl_website /
+    scrape_website 联网检索得到图片 URL 后需要了解图片内容时。
+    仅返回文字描述，不会发送任何内容到群聊。
     """
     if not urls:
         return "Failed: 未提供图片 URL。"
@@ -156,7 +161,8 @@ async def search(
     """
     Search the web using Tavily and return relevant results with content snippets.
     Use for real-time information, current events, or questions needing up-to-date
-    web sources. Prefer `crawl_website` when deep multi-page exploration is needed.
+    web sources. Prefer `crawl_website` when deep multi-page exploration is needed;
+    use `search_images` when looking for pictures instead of text.
 
     Args:
         query: Search query, e.g. "latest AI research papers 2025".
@@ -184,7 +190,9 @@ async def crawl_website(url: str, instructions: str) -> dict:
     """
     Crawl a site from a root URL and extract content across pages per natural-language
     instructions. Use when information is scattered across a site. Prefer `search`
-    for quick real-time queries.
+    for quick real-time queries. If this fails on a single page, try `scrape_website`.
+    Extracted content may contain image URLs: use `analyze_images` to identify them,
+    or `qq_send_group_msg_image` to post a found image to the group.
 
     Args:
         url: Root URL to start from, e.g. "https://docs.tavily.com".
@@ -199,6 +207,77 @@ async def crawl_website(url: str, instructions: str) -> dict:
         return {"error": str(e)}
 
 
+async def _serper_post(endpoint: str, payload: dict) -> dict:
+    headers = {"X-API-KEY": config.SERPER_API_KEY, "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(endpoint, headers=headers, json=payload)
+        response.raise_for_status()
+        return response.json()
+
+
+@tool
+async def search_images(
+    query: str, gl: str = "cn", time_range: Literal["day", "week", "month"] | None = None
+) -> str:
+    """
+    联网搜索图片（Serper Google 图片接口），返回与 query 相关的图片列表
+    （imageUrl / 标题 / 来源页面）。time_range 可限定时效：day（1 天内）、
+    week（1 周内）、month（1 月内）。
+    常与 `analyze_images` 联用：先搜图，再对感兴趣的 imageUrl 做内容识别；
+    找到想要的图后用 `qq_send_group_msg_image` 直接发送到群聊。
+
+    Args:
+        query: Search query, e.g. "deepseek logo".
+        gl: 国家/地区参数，影响结果偏好，默认 "cn"。
+        time_range: 时效过滤，不传则不限。
+    """
+    payload: dict = {"q": query, "gl": gl}
+    tbs = {"day": "qdr:d", "week": "qdr:w", "month": "qdr:m"}.get(time_range)
+    if tbs:
+        payload["tbs"] = tbs
+    else:
+        payload["tbs"] = "qdr:w"
+    try:
+        data = await _serper_post("https://google.serper.dev/images", payload)
+    except Exception as e:
+        return f"Failed: {e}"
+    images = data.get("images", [])
+    if not images:
+        return "Failed: 未搜到相关图片。"
+    lines = []
+    for idx, item in enumerate(images[:10], 1):
+        lines.append(
+            f"{idx}. title: {item.get('title', '')}\n"
+            f"   imageUrl: {item.get('imageUrl', '')}\n"
+            f"   source: {item.get('source', '')} {item.get('link', '')}"
+        )
+    return "\n".join(lines)
+
+
+@tool
+async def scrape_website(url: str) -> str:
+    """
+    抓取单个网页并返回 Markdown 正文（Serper scrape 接口，含 includeMarkdown）。
+    与 `crawl_website` 的区别：本工具面向单个页面，对 Google 已收录的普通网页
+    成功率更高；一个失败时可换另一个重试。
+    抓到的内容若包含图片 URL，可用 `analyze_images` 识别图片内容，
+    或用 `qq_send_group_msg_image` 把图片发到群聊。
+
+    Args:
+        url: 要抓取的网页 URL，e.g. "https://example.com/post".
+    """
+    try:
+        data = await _serper_post(
+            "https://scrape.serper.dev", {"url": url, "includeMarkdown": True}
+        )
+    except Exception as e:
+        return f"Failed: {e}"
+    markdown = data.get("markdown", "")
+    if not markdown:
+        return f"Failed: 未获取到网页正文（返回字段：{', '.join(data.keys())}）。"
+    return markdown
+
+
 tools_lst = [
     qq_send_group_msg,
     qq_send_group_ai_record,
@@ -206,6 +285,8 @@ tools_lst = [
     qq_send_group_msg_image,
     search,
     crawl_website,
+    scrape_website,
+    search_images,
     analyze_images,
 ]
 
@@ -215,3 +296,54 @@ interjection_tools_lst = [
     qq_send_group_ai_record,
     qq_send_group_emotion_face2,
 ]
+
+
+# ---- 工具调用日志（终端输入 tool 回车切换开关） ----
+TOOL_LOG_PATH = "data/tool_calls.log"
+_tool_log_enabled = False
+
+
+def toggle_tool_logging() -> bool:
+    """切换工具调用日志开关，返回切换后的状态。"""
+    global _tool_log_enabled
+    _tool_log_enabled = not _tool_log_enabled
+    return _tool_log_enabled
+
+
+def _log_tool_call(tool_name: str, args: dict, result: object) -> None:
+    def _fmt(value: object) -> str:
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except TypeError:
+            return repr(value)
+
+    with open(TOOL_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(
+            f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] "
+            f"tool={tool_name}\n"
+            f"args: {_fmt(args)}\n"
+            f"result: {_fmt(result)}\n\n"
+        )
+
+
+def _wrap_with_tool_logging(tool_obj):
+    """给工具协程包一层日志（仅开关开启时写文件）。"""
+    original = tool_obj.coroutine
+    if original is None:
+        return tool_obj
+
+    async def logged(**kwargs):
+        result = await original(**kwargs)
+        if _tool_log_enabled:
+            try:
+                _log_tool_call(tool_obj.name, kwargs, result)
+            except Exception as e:
+                print(f"记录工具调用日志出错: {e}")
+        return result
+
+    tool_obj.coroutine = logged
+    return tool_obj
+
+
+tools_lst = [_wrap_with_tool_logging(t) for t in tools_lst]
+interjection_tools_lst = [_wrap_with_tool_logging(t) for t in interjection_tools_lst]
