@@ -12,6 +12,7 @@ from websockets.asyncio.client import ClientConnection
 from ..action import interaction
 from ..agent.init_llm import default_group_agent, extract_final_assistant_text
 from ..handler.commands import is_group_enabled
+from ..handler.message_handler import _RATE_LIMIT_REPLY_TEXT, _is_rate_limit_error
 from ..qq_ws_context import current_qq_websocket
 
 
@@ -46,6 +47,13 @@ async def run_scheduled_broadcast(
                 await _run_broadcast_for_group(websocket, group_id=gid, slot=slot)
             except Exception as e:
                 print(f"定时群发失败 group_id={gid} slot={slot}: {e}")
+                if _is_rate_limit_error(e):
+                    try:
+                        await interaction.send_group_msg(
+                            gid, _RATE_LIMIT_REPLY_TEXT, websocket
+                        )
+                    except Exception as send_error:
+                        print(f"发送限流提示失败 group_id={gid}: {send_error}")
     finally:
         current_qq_websocket.reset(token)
 

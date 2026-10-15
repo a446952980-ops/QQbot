@@ -16,9 +16,18 @@ from websockets.asyncio.client import ClientConnection
 # 模型输出被上游内容过滤时，兼容层会抛 'str' object has no attribute 'model_dump'
 _FILTERED_REPLY_TEXT = "【filtered】"
 
+# 模型调用触发上游限流（HTTP 429）时在群里提醒
+_RATE_LIMIT_REPLY_TEXT = "token吃完了，加餐！"
+
 
 def _is_filtered_content_error(error: Exception) -> bool:
     return "model_dump" in str(error)
+
+
+def _is_rate_limit_error(error: Exception) -> bool:
+    # \b429\b：匹配 "Error code: 429 ..." / "429 Too Many Requests"，
+    # 避免误匹配时间戳、消息号等恰好包含 429 的数字串
+    return re.search(r"\b429\b", str(error)) is not None
 
 
 def _extract_reply_message_id(segments: list, raw_message: str) -> str | None:
@@ -191,12 +200,13 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
                 )
             except Exception as error:
                 print(f"随机插话执行失败: {error}")
-                if _is_filtered_content_error(error):
+                gid = int(group_id) if group_id is not None else 0
+                if _is_rate_limit_error(error):
                     await interaction.send_group_msg(
-                        int(group_id) if group_id is not None else 0,
-                        _FILTERED_REPLY_TEXT,
-                        websocket,
+                        gid, _RATE_LIMIT_REPLY_TEXT, websocket
                     )
+                elif _is_filtered_content_error(error):
+                    await interaction.send_group_msg(gid, _FILTERED_REPLY_TEXT, websocket)
         if not is_at_self:
             display_name = sender.get("card") or sender_name or "未知群成员"
             append_background_message(
@@ -265,6 +275,13 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
                         image_inputs=image_inputs,
                     )
                 except Exception as error:
+                    if _is_rate_limit_error(error):
+                        await interaction.send_group_msg(
+                            int(group_id) if group_id is not None else 0,
+                            _RATE_LIMIT_REPLY_TEXT,
+                            websocket,
+                        )
+                        return
                     if not _is_filtered_content_error(error):
                         raise
                     await interaction.send_group_msg_reply(

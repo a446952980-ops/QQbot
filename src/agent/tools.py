@@ -4,12 +4,27 @@ from pathlib import PurePosixPath
 import random
 
 from langchain.tools import tool
+from langchain_core.messages import HumanMessage
+from langchain_openai import ChatOpenAI
 import config
 from tavily import AsyncTavilyClient
 from ..action import interaction
 from .face_enum import list_face_enum_keys, resolve_face
 
 tavily_client = AsyncTavilyClient(config.TAVILY_KEY)
+
+# 供 analyze_images 使用的视觉模型；未配置 VISION_MODEL 时退回默认模型
+_vision_llm = ChatOpenAI(
+    model=config.VISION_MODEL or config.DEFAULT_MODEL,
+    temperature=0.1,
+    max_tokens=4096,
+    timeout=120,
+    api_key=config.AI_KEY,
+    base_url=config.AI_BASE_URL,
+    extra_body={"thinking": {"type": "disabled"}},
+)
+
+_DEFAULT_VISION_PROMPT = "请分别描述每张图片的内容，包括主要对象、出现的文字和关键细节。"
 
 _FACE_ENUM_DOC = ", ".join(list_face_enum_keys()) or "(none configured)"
 
@@ -91,6 +106,46 @@ async def qq_send_group_emotion_face2(group_id: int) -> str:
 
 
 @tool
+async def qq_send_group_msg_image(group_id: int, url: str) -> str:
+    """
+    根据已知的图片 URL 直接发送图片到群聊。
+    常用于群友要求找图时：先结合 search / crawl_website 联网检索拿到相关图片的 URL，
+    再用本工具把找到的图片直接发到群里。url 必须是可公网访问的 http(s) 图片直链。
+    """
+    try:
+        await interaction.send_group_msg_image(group_id, "pic.png", url, sub_type=0)
+    except RuntimeError as e:
+        return f"Failed: {e}"
+    return "Image sent to the group."
+
+
+@tool
+async def analyze_images(urls: list[str], prompt: str | None = None) -> str:
+    """
+    识别一张或多张图片（传入图片 URL），由 VISION_MODEL 分析后返回文字描述。
+    默认提示词为「描述图片内容」；需要特定识别目标（如提取图中文字、辨认物体/人物、
+    结合联网搜索结果判断图片出处等）时可用 prompt 自定义。
+    适用场景：群里给出图片链接，或 search / crawl_website 联网检索得到图片 URL
+    后需要了解图片内容时。仅返回文字描述，不会发送任何内容到群聊。
+    """
+    if not urls:
+        return "Failed: 未提供图片 URL。"
+    content: list[dict[str, object]] = [
+        {"type": "text", "text": (prompt or "").strip() or _DEFAULT_VISION_PROMPT}
+    ]
+    for url in urls:
+        content.append({"type": "image_url", "image_url": {"url": url}})
+    try:
+        response = await _vision_llm.ainvoke([HumanMessage(content=content)])
+    except Exception as e:
+        return f"Failed: {e}"
+    text = response.content
+    if isinstance(text, list):  # 兼容多段返回，仅取文本部分
+        text = "".join(part.get("text", "") for part in text if isinstance(part, dict))
+    return str(text) or "Failed: 视觉模型未返回内容。"
+
+
+@tool
 async def search(
     query: str,
     topic: Literal["general", "news", "finance"] = None,
@@ -148,8 +203,10 @@ tools_lst = [
     qq_send_group_msg,
     qq_send_group_ai_record,
     qq_send_group_emotion_face2,
+    qq_send_group_msg_image,
     search,
     crawl_website,
+    analyze_images,
 ]
 
 # Random interjections only need tools that visibly post to the group.
