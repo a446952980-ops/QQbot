@@ -15,6 +15,7 @@ import config
 from tavily import AsyncTavilyClient
 from ..action import interaction
 from ..qq_ws_context import current_qq_websocket
+from ..tts.client import synthesize_to_mp3 as _tts_synthesize_to_mp3
 from .aliyun_image_gen import generate_images as _aliyun_generate_images
 from .face_enum import list_face_enum_keys, resolve_face
 
@@ -218,6 +219,32 @@ async def crawl_website(url: str, instructions: str) -> dict:
 
 
 @tool
+async def qq_send_group_msg_voice(group_id: int, text: str) -> str:
+    """
+    把一段文字合成为语音，并以 QQ 语音消息发送到群聊。
+    适合念一段话、讲故事、温柔读消息等场景；语音在后台流式合成（mp3）
+    后自动发送，无需上传文件。
+    text 会被完整朗读：只传要说的内容，不要混入表情代码、图片链接或 markdown。
+
+    Args:
+        group_id: QQ group ID.
+        text: 要朗读的文字。
+    """
+    text = (text or "").strip()
+    if not text:
+        return "Failed: 未提供要朗读的文字。"
+    try:
+        mp3_path = await _tts_synthesize_to_mp3(text)
+    except Exception as e:
+        return f"Failed: 语音合成失败 {e}"
+    try:
+        await interaction.send_group_msg_record(group_id, mp3_path)
+    except Exception as e:
+        return f"Failed: 语音发送失败 {e}"
+    return "OK"
+
+
+@tool
 async def generate_image(prompt: str) -> str:
     """
     后台生图（阿里云 qwen 生图模型），不阻塞当前对话，仅支持群聊被 @ 场景。
@@ -341,9 +368,10 @@ async def scrape_website(url: str) -> str:
 
 tools_lst = [
     qq_send_group_msg,
-    qq_send_group_ai_record,
+    # qq_send_group_ai_record,
     qq_send_group_emotion_face2,
     qq_send_group_msg_image,
+    qq_send_group_msg_voice,
     search,
     crawl_website,
     scrape_website,
@@ -355,7 +383,8 @@ tools_lst = [
 # Random interjections only need tools that visibly post to the group.
 interjection_tools_lst = [
     qq_send_group_msg,
-    qq_send_group_ai_record,
+    qq_send_group_msg_voice,
+    # qq_send_group_ai_record,
     qq_send_group_emotion_face2,
 ]
 

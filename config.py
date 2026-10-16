@@ -41,6 +41,10 @@ DASHSCOPE_API_MODEL = os.getenv("DASHSCOPE_API_MODEL")
 # NapCat send_group_ai_record voice character id (override via AI_VOICE_CHARACTER)
 AI_VOICE_CHARACTER = (os.getenv("AI_VOICE_CHARACTER") or "lucy-voice-female1").strip()
 
+# ---- 火山引擎流式 TTS（src/tts/），三要素从环境变量加载 ----
+TTS_APP_ID = (os.getenv("TTS_APP_ID") or "").strip()
+TTS_ACCESS_TOKEN = (os.getenv("TTS_ACCESS_TOKEN") or "").strip()
+TTS_VOICE_TYPE = (os.getenv("TTS_VOICE_TYPE") or "").strip()
 
 def _parse_int_list(raw: str) -> list[int]:
     ids: list[int] = []

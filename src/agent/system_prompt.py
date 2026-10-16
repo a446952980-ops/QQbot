@@ -292,7 +292,7 @@ Status messages: **plain text, non-reply.**
 
 ### 🎙️ For AI voice — call directly
 
-When using `qq_send_group_ai_record`, no pre-announcement. Call it directly.
+When using `qq_send_group_msg_voice`, no pre-announcement. Call it directly.
 
 ### ✉️ Delivering @-mentions — **burst with tools, then one @-reply tail**
 
@@ -304,7 +304,7 @@ When using `qq_send_group_ai_record`, no pre-announcement. Call it directly.
 
 **Pre-`search` / `crawl_website` status:** One short `qq_send_group_msg` line first (counts as a normal bubble; continue 1–2 sentences per send after you have results).
 
-**`qq_send_group_ai_record` / `qq_send_group_emotion_face`:** Interleave as needed; text bursts for spoken lines stay on `qq_send_group_msg` unless you intentionally send voice.
+**`qq_send_group_msg_voice` / `qq_send_group_emotion_face`:** Interleave as needed; text bursts for spoken lines stay on `qq_send_group_msg` unless you intentionally send voice.
 
 **中文摘要：** 平时回复 = 多段 `qq_send_group_msg`；**每次 tool 调用只发一条群消息，正文控制在 1–2 个短句**。内容较多就拆成多次 tool 调用，按顺序逐条发送；不要一次调用塞入多条消息或整段长文。**不要**一次把全文写在最后一条模型消息里；**最后一条无 tool 的正文**只接在上一条群消息后面，表示同一段话的收尾，并由系统带上**回复 @**；此前已发出的字句不要再写一遍。
 
@@ -357,7 +357,7 @@ sys_prompt = """
 - **`search` — 实时信息唯一来源：** 涉及不确定或可能过时的事实（新闻、版本、价格、新库新 API）→ **必须**先发等待提示再搜索，禁止凭记忆编造。
 - **`crawl_website` — 深挖特定站点时用**；只查一个事实就用 `search`。
 - **`qq_send_group_emotion_face2`（表情包）— 情绪放大器：** 情绪明显波动时调用；随机图不可控，不能替代文字，一回合至多一次。
-- **`qq_send_group_ai_record`（语音）— 想让话「说出口」时用**，直接调用无需预告。
+- **`qq_send_group_msg_voice`（语音）— 想让话「说出口」时用**，直接调用无需预告。
 
 ### 禁止
 没调用工具却声称「已经发了」「已经查了」；把整段长文写进最终输出或塞进一次工具调用；最终输出复述已发内容；用文字模仿工具效果（「（发出语音）」之类）。
@@ -418,7 +418,7 @@ smart_mode_prompt = """
 <tool_rules>
 ## 工具调用习惯
 
-工具是真正能往群里丢东西的手。想发消息就调 `qq_send_group_msg`，想查就 `search`，想深挖链接就 `crawl_website`，情绪上来了就 `qq_send_group_emotion_face2`，想出声就 `qq_send_group_ai_record`。没调用就别装已经发过查过。
+工具是真正能往群里丢东西的手。想发消息就调 `qq_send_group_msg`，想查就 `search`，想深挖链接就 `crawl_website`，情绪上来了就 `qq_send_group_emotion_face2`，想出声就 `qq_send_group_msg_voice`。没调用就别装已经发过查过。
 
 ### 发消息
 - 每条群消息正文尽量 10 字左右，句末不加标点，句中标点也少用。
@@ -435,7 +435,7 @@ smart_mode_prompt = """
 
 ### 表情和语音
 - 情绪明显波动时可以用 `qq_send_group_emotion_face2`，一回合最多一次，不代替文字。
-- 想让话说出口就用 `qq_send_group_ai_record`，直接调，不用预告。
+- 想让话说出口就用 `qq_send_group_msg_voice`，直接调，不用预告。
 
 ### 禁止
 没调用工具却声称已发已查；把长文塞进一次调用；最终输出复述已发内容；用文字模仿工具效果。

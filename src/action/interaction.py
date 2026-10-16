@@ -1,7 +1,9 @@
+import base64
 import json
 import random
 import re
 from collections.abc import Sequence
+from pathlib import Path
 
 import config
 from websockets.asyncio.client import ClientConnection
@@ -200,6 +202,36 @@ async def send_group_msg_reply(
         )
     )
     print(f"回复了 {msg_id} 消息")
+
+
+async def send_group_msg_record(
+    group_id: int, file: str, websocket: ClientConnection | None = None
+):
+    """Send a voice record message to a QQ group (NapCat send_group_msg record segment).
+    `file` 支持 http(s) URL / file:/// / base64:// / 本地路径。
+    本地路径直接内联为 base64://：NapCat 可能运行在另一进程/容器中，其文件系统
+    未必能访问本机路径（file:// 会报 Failed to open input: No such file or directory）。"""
+    if not file.startswith(("http://", "https://", "file://", "base64://")):
+        file = "base64://" + base64.b64encode(Path(file).read_bytes()).decode()
+    ws = _resolve_ws(websocket)
+    await send_ws_event(
+        ws,
+        json.dumps(
+            {
+                "action": "send_group_msg",
+                "params": {
+                    "group_id": group_id,
+                    "message": [
+                        {
+                            "type": "record",
+                            "data": {"file": file},
+                        }
+                    ],
+                },
+            }
+        ),
+    )
+    print(f"在 {group_id} 发送了语音 {file}")
 
 
 async def send_group_msg_image(
