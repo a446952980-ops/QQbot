@@ -43,11 +43,18 @@ async def run_scheduled_broadcast(
         for gid in config.PROACTIVE_GROUP_IDS:
             if not is_group_enabled(gid):
                 continue  # 该群已被管理员 /shutdown
-            try:
-                await _run_broadcast_for_group(websocket, group_id=gid, slot=slot)
-            except Exception as e:
-                print(f"定时群发失败 group_id={gid} slot={slot}: {e}")
-                if _is_rate_limit_error(e):
+            # 每群独立子任务执行：/stop 取消时只终止该次群发，不影响调度循环
+            broadcast_task = asyncio.create_task(
+                _run_broadcast_for_group(websocket, group_id=gid, slot=slot)
+            )
+            results = await asyncio.gather(broadcast_task, return_exceptions=True)
+            error = results[0] if results else None
+            if isinstance(error, asyncio.CancelledError):
+                print(f"定时群发已被 /stop 终止 group_id={gid} slot={slot}")
+                continue
+            if error is not None:
+                print(f"定时群发失败 group_id={gid} slot={slot}: {error}")
+                if _is_rate_limit_error(error):
                     try:
                         await interaction.send_group_msg(
                             gid, _RATE_LIMIT_REPLY_TEXT, websocket

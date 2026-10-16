@@ -1,6 +1,7 @@
 import json
 import random
 import re
+from collections.abc import Sequence
 
 import config
 from websockets.asyncio.client import ClientConnection
@@ -204,11 +205,21 @@ async def send_group_msg_reply(
 async def send_group_msg_image(
     group_id: int,
     file: str,
-    url: str,
+    url: str | Sequence[str],
     sub_type: int = 1,
     websocket: ClientConnection | None = None,
+    at_user: int | None = None,
 ):
-    """Send a single image to a QQ group (NapCat send_group_msg image segment). `sub_type` 1 is required for expression-style images."""
+    """Send one or more images to a QQ group (NapCat send_group_msg image segments).
+    `sub_type` 1 is required for expression-style images. `at_user` 可选：发送时先 @ 某成员。"""
+    urls = [url] if isinstance(url, str) else list(url)
+    message: list[dict] = []
+    if at_user is not None:
+        message.append({"type": "at", "data": {"qq": str(at_user)}})
+    message.extend(
+        {"type": "image", "data": {"file": file, "url": u, "sub_type": sub_type}}
+        for u in urls
+    )
     ws = _resolve_ws(websocket)
     await send_ws_event(
         ws,
@@ -217,18 +228,9 @@ async def send_group_msg_image(
                 "action": "send_group_msg",
                 "params": {
                     "group_id": group_id,
-                    "message": [
-                        {
-                            "type": "image",
-                            "data": {
-                                "file": file,
-                                "url": url,
-                                "sub_type": sub_type,
-                            },
-                        }
-                    ],
+                    "message": message,
                 },
             }
         )
     )
-    print(f"在 {group_id} 发送了图片 {file}")
+    print(f"在 {group_id} 发送了图片 {file} x{len(urls)}")

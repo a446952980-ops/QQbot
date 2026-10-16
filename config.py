@@ -35,6 +35,9 @@ VISION_MODEL = os.getenv("VISION_MODEL")
 AI_KEY = os.getenv("AI_KEY")
 AI_BASE_URL = os.getenv("AI_BASE_URL")
 
+DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
+DASHSCOPE_API_MODEL = os.getenv("DASHSCOPE_API_MODEL")
+
 # NapCat send_group_ai_record voice character id (override via AI_VOICE_CHARACTER)
 AI_VOICE_CHARACTER = (os.getenv("AI_VOICE_CHARACTER") or "lucy-voice-female1").strip()
 

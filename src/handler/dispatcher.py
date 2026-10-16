@@ -10,7 +10,7 @@ async def handle_event(event_data: dict, websocket: ClientConnection):
     # print(f"收到事件: {json.dumps(event_data, ensure_ascii=False, indent=2)}")
 
 
-    if event_data.get("post_type") == "message":
+    if event_data.get("post_type") in ("message", "message_sent"):
         print(f"收到消息: {event_data.get('message')}")
         # print(f"收到消息: {json.dumps(event_data, ensure_ascii=False, indent=2)}")
         try:

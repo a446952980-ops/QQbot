@@ -1,7 +1,9 @@
 from typing import Literal, Sequence
 from urllib.parse import unquote, urlparse
 from pathlib import PurePosixPath
+from contextvars import ContextVar
 from datetime import datetime
+import asyncio
 import json
 import random
 
@@ -12,9 +14,17 @@ import httpx
 import config
 from tavily import AsyncTavilyClient
 from ..action import interaction
+from ..qq_ws_context import current_qq_websocket
+from .aliyun_image_gen import generate_images as _aliyun_generate_images
 from .face_enum import list_face_enum_keys, resolve_face
 
 tavily_client = AsyncTavilyClient(config.TAVILY_KEY)
+
+# 当前 @ 消息上下文（由 init_llm.ainvoke_group_at 设置）：
+# generate_image 自动取参考图、群号与 @ 目标，无需模型传参
+current_group_id: ContextVar[int | None] = ContextVar("current_group_id", default=None)
+current_sender_id: ContextVar[int | None] = ContextVar("current_sender_id", default=None)
+current_image_urls: ContextVar[tuple[str, ...]] = ContextVar("current_image_urls", default=())
 
 # 供 analyze_images 使用的视觉模型；未配置 VISION_MODEL 时退回默认模型
 _vision_llm = ChatOpenAI(
@@ -207,6 +217,57 @@ async def crawl_website(url: str, instructions: str) -> dict:
         return {"error": str(e)}
 
 
+@tool
+async def generate_image(prompt: str) -> str:
+    """
+    后台生图（阿里云 qwen 生图模型），不阻塞当前对话，仅支持群聊被 @ 场景。
+    当前 @ 消息及其引用消息里的图片（最多 3 张）自动作为参考图传入，无需传参；
+    仅需 prompt 描述要生成的图片（涉及参考图时用 "Image 1 / Image 2" 指代）。
+    调用后任务立即提交、图片尚未生成：完成后所有生成图片会自动发到本群并
+    @ 发起请求的用户；失败只记录终端日志。
+    收到本工具返回后，必须告知用户图片正在生成中、稍后自动送达，不得说已生成完成。
+
+    Args:
+        prompt: 生图内容描述，例如在有多张参考图时传入 "让 Image 1 的人物穿上 Image 2 的黑裙,"。
+    """
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return "Failed: 未提供生图 prompt。"
+    group_id = current_group_id.get()
+    websocket = current_qq_websocket.get()
+    if group_id is None or websocket is None:
+        return "Failed: 生图仅支持在被 @ 的群聊回复中使用。"
+    sender_id = current_sender_id.get()
+    reference_urls = current_image_urls.get()
+    asyncio.create_task(
+        _run_image_generation(group_id, sender_id, prompt, reference_urls, websocket)
+    )
+    return (
+        "生图任务已提交，正在后台生成（尚未完成）。请告知用户：图片正在生成中，"
+        "完成后会自动发到群里并 @ 你。"
+    )
+
+
+async def _run_image_generation(
+    group_id: int,
+    sender_id: int | None,
+    prompt: str,
+    reference_urls: tuple[str, ...],
+    websocket,
+) -> None:
+    try:
+        urls = await _aliyun_generate_images(prompt, reference_urls)
+    except Exception as error:  # 生图报错只记终端日志，不打扰群聊
+        print(f"生图任务失败 group_id={group_id} prompt={prompt!r}: {error}")
+        return
+    try:
+        await interaction.send_group_msg_image(
+            group_id, "pic.png", urls, websocket=websocket, at_user=sender_id
+        )
+    except Exception as error:
+        print(f"生图结果发送失败 group_id={group_id}: {error}")
+
+
 async def _serper_post(endpoint: str, payload: dict) -> dict:
     headers = {"X-API-KEY": config.SERPER_API_KEY, "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=30) as client:
@@ -288,6 +349,7 @@ tools_lst = [
     scrape_website,
     search_images,
     analyze_images,
+    generate_image,
 ]
 
 # Random interjections only need tools that visibly post to the group.

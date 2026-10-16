@@ -160,6 +160,18 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
                 text_parts.append(data["text"])
         text = "".join(text_parts)
 
+        # 账号自身发送的群消息（NapCat 以 message_sent 上报，如终端注入发送）：
+        # 仅做指令生效判断，不进入插话 / 背景记录 / @ 回复流程
+        if event_data.get("post_type") == "message_sent":
+            print(f"【{group_name}】[自身消息] {text}")
+            await try_handle_group_command(
+                text,
+                group_id=int(group_id) if group_id is not None else 0,
+                websocket=websocket,
+                sender_id=sender_id,
+            )
+            return
+
         # 群内 “/” 指令（完全匹配）：命中即执行并结束本条消息的处理
         if await try_handle_group_command(
             text,

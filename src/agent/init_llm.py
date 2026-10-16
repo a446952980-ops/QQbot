@@ -16,7 +16,13 @@ from .conversation_history import (
     history_as_messages,
 )
 from .group_prompt import get_active_prompt_name, get_prompt_text
-from .tools import interjection_tools_lst, tools_lst
+from .tools import (
+    current_group_id,
+    current_image_urls,
+    current_sender_id,
+    interjection_tools_lst,
+    tools_lst,
+)
 
 _RANDOM_INTERJECTION_PROMPT = """
 现在没有任何人专门对你说话，只是群友们在自己闲聊，所以不要以对方在向自己说话的方式回复，而是要结合历史信息发送结合当前情境下适当的消息。
@@ -90,6 +96,40 @@ def _build_multimodal_human_content(
             }
         )
     return content
+
+
+# ---- 进行中模型调用登记（/stop、/shutdown 用于强行终止某群全部调用） ----
+# 值为正在执行 ainvoke_* 的任务：@ 回复 / 随机插话 = 消息事件处理任务，
+# 定时群发 = 每群独立的广播子任务（cancel 不会波及调度循环）
+_active_invocation_tasks: dict[int, set[asyncio.Task]] = {}
+
+
+def _register_invocation(group_id: int) -> asyncio.Task | None:
+    task = asyncio.current_task()
+    if task is not None:
+        _active_invocation_tasks.setdefault(int(group_id), set()).add(task)
+    return task
+
+
+def _unregister_invocation(group_id: int, task: asyncio.Task | None) -> None:
+    if task is None:
+        return
+    tasks = _active_invocation_tasks.get(int(group_id))
+    if tasks is not None:
+        tasks.discard(task)
+        if not tasks:
+            _active_invocation_tasks.pop(int(group_id), None)
+
+
+def cancel_group_invocations(group_id: int) -> int:
+    """强行终止某群所有进行中的模型调用任务，返回终止数量。"""
+    tasks = _active_invocation_tasks.pop(int(group_id), set())
+    count = 0
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+            count += 1
+    return count
 
 
 class QQGroupAgent:
@@ -183,16 +223,20 @@ class QQGroupAgent:
         agent = self._get_interjection_agent(
             get_active_prompt_name(group_id), vision=bool(image_inputs)
         )
-        async with self._inv_lock:
-            await agent.ainvoke(
-                {
-                    "messages": [
-                        HumanMessage(
-                            content=_build_multimodal_human_content(content, image_inputs)
-                        )
-                    ]
-                }
-            )
+        task = _register_invocation(group_id)
+        try:
+            async with self._inv_lock:
+                await agent.ainvoke(
+                    {
+                        "messages": [
+                            HumanMessage(
+                                content=_build_multimodal_human_content(content, image_inputs)
+                            )
+                        ]
+                    }
+                )
+        finally:
+            _unregister_invocation(group_id, task)
 
     def build_messages_for_group_at(
         self,
@@ -255,8 +299,18 @@ class QQGroupAgent:
         agent = self._get_chat_agent(
             get_active_prompt_name(group_id), vision=bool(image_inputs)
         )
-        async with self._inv_lock:
-            result = await agent.ainvoke({"messages": messages_in})
+        # 供 generate_image 等工具自动获取当前 @ 上下文（参考图 / 群号 / @ 目标）
+        current_group_id.set(int(group_id))
+        current_sender_id.set(int(sender_id))
+        current_image_urls.set(
+            tuple(url for _, url in image_inputs) if image_inputs else ()
+        )
+        task = _register_invocation(group_id)
+        try:
+            async with self._inv_lock:
+                result = await agent.ainvoke({"messages": messages_in})
+        finally:
+            _unregister_invocation(group_id, task)
         messages_full = result.get("messages", [])
         # Only this round (exclude re-injected history) so cache is not duplicated.
         suffix = messages_full[len(prior) :]
@@ -288,8 +342,12 @@ class QQGroupAgent:
         prior = history_as_messages(group_id)
         messages_in = prior + [HumanMessage(content=user_content)]
         agent = self._get_chat_agent(get_active_prompt_name(group_id), vision=False)
-        async with self._inv_lock:
-            result = await agent.ainvoke({"messages": messages_in})
+        task = _register_invocation(group_id)
+        try:
+            async with self._inv_lock:
+                result = await agent.ainvoke({"messages": messages_in})
+        finally:
+            _unregister_invocation(group_id, task)
         messages_full = result.get("messages", [])
         suffix = messages_full[len(prior) :]
         assistant_combined = build_assistant_combined_for_cache(suffix)

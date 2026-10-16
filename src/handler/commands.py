@@ -18,6 +18,7 @@ from websockets.asyncio.client import ClientConnection
 
 from ..action import interaction
 from ..agent import conversation_history, group_prompt
+from ..agent.init_llm import cancel_group_invocations
 
 TIMED_MODE_DEFAULT_MINUTES = 10
 
@@ -45,6 +46,7 @@ class GroupCommand(str, Enum):
     SMART_MODE = "/smart_mode"
     MODE_RESET = "/mode_reset"
     EMPTY = "/empty"
+    STOP = "/stop"
     SHUTDOWN = "/shutdown"
     STARTUP = "/startup"
 
@@ -135,15 +137,34 @@ async def _handle_empty(
     return False  # 传参错误：不触发，按普通消息处理
 
 
+async def _handle_stop(
+    arg: str | None, *, group_id: int, websocket: ClientConnection
+) -> bool:
+    """/stop：强行终止本群所有进行中的模型调用（不改变本群的消息处理开关）"""
+    if arg is not None:
+        return False  # 带了任何参数都不触发
+    count = cancel_group_invocations(group_id)
+    text = (
+        f"强行终止 {count}"
+        if count
+        else "0"
+    )
+    await interaction.send_group_msg(group_id, text, websocket)
+    return True
+
+
 async def _handle_shutdown(
     arg: str | None, *, group_id: int, websocket: ClientConnection
 ) -> bool:
-    """/shutdown：仅在本群停止处理消息（仍接收并记日志），/startup 可恢复"""
+    """/shutdown：仅在本群停止处理消息（仍接收并记日志），/startup 可恢复；
+    同时强行终止本群进行中的模型调用"""
     if arg is not None:
         return False  # 带了任何参数都不触发
     set_group_enabled(group_id, False)
+    cancelled = cancel_group_invocations(group_id)
+    suffix = f"（{cancelled}）" if cancelled else ""
     await interaction.send_group_msg(
-        group_id, "睡觉喽", websocket
+        group_id, f"睡觉喽{suffix}", websocket
     )
     return True
 
@@ -164,6 +185,7 @@ _COMMAND_HANDLERS: dict[GroupCommand, Callable[..., Awaitable[bool]]] = {
     GroupCommand.SMART_MODE: _handle_smart_mode,
     GroupCommand.MODE_RESET: _handle_mode_reset,
     GroupCommand.EMPTY: _handle_empty,
+    GroupCommand.STOP: _handle_stop,
     GroupCommand.SHUTDOWN: _handle_shutdown,
     GroupCommand.STARTUP: _handle_startup,
 }

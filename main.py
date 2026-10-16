@@ -65,7 +65,7 @@ async def connect_to_napcat():
                             event_data = json.loads(message)
                             if resolve_napcat_api_response(event_data):
                                 continue
-                            if event_data.get("post_type") == "message":
+                            if event_data.get("post_type") in ("message", "message_sent"):
                                 task = asyncio.create_task(
                                     handle_event(event_data, websocket)
                                 )
