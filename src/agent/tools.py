@@ -16,7 +16,14 @@ from tavily import AsyncTavilyClient
 from ..action import interaction
 from ..qq_ws_context import current_qq_websocket
 from ..tts.client import synthesize_to_mp3 as _tts_synthesize_to_mp3
-from .aliyun_image_gen import generate_images as _aliyun_generate_images
+from . import aliyun_image_gen, volces_image_gen
+
+# 生图平台按 config.IMAGE_GEN_PLATFORM 分发（aliyun / volc），同签名可互换
+_IMAGE_GENERATOR = (
+    volces_image_gen.generate_images
+    if config.IMAGE_GEN_PLATFORM == "volc"
+    else aliyun_image_gen.generate_images
+)
 from .face_enum import list_face_enum_keys, resolve_face
 
 tavily_client = AsyncTavilyClient(config.TAVILY_KEY)
@@ -244,19 +251,30 @@ async def qq_send_group_msg_voice(group_id: int, text: str) -> str:
     return "OK"
 
 
-@tool
-async def generate_image(prompt: str) -> str:
-    """
-    后台生图（阿里云 qwen 生图模型），不阻塞当前对话，仅支持群聊被 @ 场景。
-    当前 @ 消息及其引用消息里的图片（最多 3 张）自动作为参考图传入，无需传参；
-    仅需 prompt 描述要生成的图片（涉及参考图时用 "Image 1 / Image 2" 指代）。
-    调用后任务立即提交、图片尚未生成：完成后所有生成图片会自动发到本群并
-    @ 发起请求的用户；失败只记录终端日志。
-    收到本工具返回后，必须告知用户图片正在生成中、稍后自动送达，不得说已生成完成。
+_IMAGE_TOOL_COMMON = """后台生图，不阻塞当前对话，仅支持群聊被 @ 场景。
+当前 @ 消息及其引用消息里的图片（最多 3 张）自动作为参考图传入，无需传参；
+仅需 prompt 描述要生成的图片（涉及参考图时用 "Image 1 / Image 2" 指代）。
+调用后任务立即提交、图片尚未生成：完成后所有生成图片会自动发到本群并
+@ 发起请求的用户；失败只记录终端日志。
+收到本工具返回后，必须告知用户图片正在生成中、稍后自动送达，不得说已生成完成。"""
+
+if config.IMAGE_GEN_PLATFORM == "volc":
+    _GENERATE_IMAGE_DOC = f"""使用火山方舟 Seedream 生图，不依赖参考图也可纯文生图。
+{_IMAGE_TOOL_COMMON}
+prompt 可直接描述想要的画面比例（如 "竖版 3:4"）；涉及时效性、事实或
+需要查证的信息时，需在 prompt 中特别要求，平台会自动联网搜索辅助生图。
 
     Args:
-        prompt: 生图内容描述，例如在有多张参考图时传入 "让 Image 1 的人物穿上 Image 2 的黑裙,"。
-    """
+        prompt: 生图内容描述，可包含画面细节与比例。"""
+else:
+    _GENERATE_IMAGE_DOC = f"""使用阿里云 qwen-mt-image-2.0 生图。
+{_IMAGE_TOOL_COMMON}
+
+    Args:
+        prompt: 生图内容描述，例如在有多张参考图时传入 "让 Image 1 的人物穿上 Image 2 的黑裙,"。"""
+
+
+async def _generate_image(prompt: str) -> str:
     prompt = (prompt or "").strip()
     if not prompt:
         return "Failed: 未提供生图 prompt。"
@@ -270,9 +288,13 @@ async def generate_image(prompt: str) -> str:
         _run_image_generation(group_id, sender_id, prompt, reference_urls, websocket)
     )
     return (
-        "生图任务已提交，正在后台生成（尚未完成）。请告知用户：图片正在生成中，"
-        "完成后会自动发到群里并 @ 你。"
+        "生图任务已提交，正在后台生成（尚未完成）。请告知用户图片生成中，"
+        "完成后会@用户发过去。"
     )
+
+
+_generate_image.__doc__ = _GENERATE_IMAGE_DOC
+generate_image = tool(_generate_image)
 
 
 async def _run_image_generation(
@@ -283,7 +305,7 @@ async def _run_image_generation(
     websocket,
 ) -> None:
     try:
-        urls = await _aliyun_generate_images(prompt, reference_urls)
+        urls = await _IMAGE_GENERATOR(prompt, reference_urls)
     except Exception as error:  # 生图报错只记终端日志，不打扰群聊
         print(f"生图任务失败 group_id={group_id} prompt={prompt!r}: {error}")
         return

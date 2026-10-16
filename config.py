@@ -46,6 +46,13 @@ TTS_APP_ID = (os.getenv("TTS_APP_ID") or "").strip()
 TTS_ACCESS_TOKEN = (os.getenv("TTS_ACCESS_TOKEN") or "").strip()
 TTS_VOICE_TYPE = (os.getenv("TTS_VOICE_TYPE") or "").strip()
 
+# ---- 生图平台切换（aliyun / volc），key 与模型读环境变量 ----
+IMAGE_GEN_PLATFORM = (os.getenv("IMAGE_GEN_PLATFORM") or "aliyun").strip().lower()
+ARK_API_KEY = (os.getenv("ARK_API_KEY") or "").strip()
+VOLCES_IMAGE_MODEL = (
+    os.getenv("VOLCES_IMAGE_MODEL") or "doubao-seedream-5-0-260128"
+).strip()
+
 def _parse_int_list(raw: str) -> list[int]:
     ids: list[int] = []
     for part in raw.replace(";", ",").split(","):
