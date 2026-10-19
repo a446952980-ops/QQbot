@@ -17,6 +17,8 @@ from .conversation_history import (
 )
 from .group_prompt import get_active_prompt_name, get_prompt_text
 from .tools import (
+    _in_at_flow,
+    _send_msg_state,
     current_group_id,
     current_image_urls,
     current_sender_id,
@@ -210,9 +212,11 @@ class QQGroupAgent:
         text: str,
         image_inputs: list[tuple[str, str]] | None = None,
     ) -> None:
-        """Run a tool-only random interjection without reading or writing history."""
+        """Run a tool-only random interjection; replay history for context
+        (background + cached @ turns) but write nothing back."""
         content = (
-            "Random interjection context (use real IDs in tools):\n"
+            "Random interjection context (use real IDs in tools; the group's "
+            "recent history is provided above for context):\n"
             f"- group_id: {group_id}\n"
             f"- group_name: {group_name}\n"
             f"- sender_name: {sender_name}\n"
@@ -223,15 +227,17 @@ class QQGroupAgent:
         agent = self._get_interjection_agent(
             get_active_prompt_name(group_id), vision=bool(image_inputs)
         )
+        _send_msg_state.set([0])  # 单次模型调用的发送次数限制从头计数
         task = _register_invocation(group_id)
         try:
             async with self._inv_lock:
                 await agent.ainvoke(
                     {
                         "messages": [
+                            *history_as_messages(group_id),
                             HumanMessage(
                                 content=_build_multimodal_human_content(content, image_inputs)
-                            )
+                            ),
                         ]
                     }
                 )
@@ -299,9 +305,12 @@ class QQGroupAgent:
         agent = self._get_chat_agent(
             get_active_prompt_name(group_id), vision=bool(image_inputs)
         )
-        # 供 generate_image 等工具自动获取当前 @ 上下文（参考图 / 群号 / @ 目标）
+        # 供 generate_image 等工具自动获取当前 @ 上下文（参考图 / 群号 / @ 目标），
+        # 并标记 @ 流程使 qq_send_group_msg 跳过 background 记录（turn 已含发送文本）
         current_group_id.set(int(group_id))
         current_sender_id.set(int(sender_id))
+        _in_at_flow.set(True)
+        _send_msg_state.set([0])  # 单次模型调用的发送次数限制从头计数
         current_image_urls.set(
             tuple(url for _, url in image_inputs) if image_inputs else ()
         )
@@ -342,6 +351,7 @@ class QQGroupAgent:
         prior = history_as_messages(group_id)
         messages_in = prior + [HumanMessage(content=user_content)]
         agent = self._get_chat_agent(get_active_prompt_name(group_id), vision=False)
+        _send_msg_state.set([0])  # 单次模型调用的发送次数限制从头计数
         task = _register_invocation(group_id)
         try:
             async with self._inv_lock:

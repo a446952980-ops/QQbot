@@ -9,15 +9,20 @@ from ..action import interaction
 from ..agent.conversation_history import append_background_message
 from ..agent.init_llm import default_group_agent, extract_final_assistant_text
 from ..qq_ws_context import current_qq_websocket
-from .commands import is_group_enabled, try_handle_group_command
+from .commands import (
+    is_at_reply_enabled,
+    is_group_enabled,
+    is_interjection_enabled,
+    try_handle_group_command,
+)
 
 from websockets.asyncio.client import ClientConnection
 
 # 模型输出被上游内容过滤时，兼容层会抛 'str' object has no attribute 'model_dump'
-_FILTERED_REPLY_TEXT = "【filtered】"
+_FILTERED_REPLY_TEXT = "【Filtered】"
 
 # 模型调用触发上游限流（HTTP 429）时在群里提醒
-_RATE_LIMIT_REPLY_TEXT = "token吃完了，加餐！"
+_RATE_LIMIT_REPLY_TEXT = "token吃完了"
 
 
 def _is_filtered_content_error(error: Exception) -> bool:
@@ -61,7 +66,13 @@ def _format_message_content(message: object) -> str:
                 parts.append(value)
         elif segment_type == "image":
             summary = data.get("summary") or data.get("file")
-            parts.append(f"[图片{': ' + str(summary) if summary else ''}]")
+            image_url = data.get("url")
+            parsed = urlparse(image_url) if isinstance(image_url, str) else None
+            if parsed and parsed.scheme in {"http", "https"} and parsed.netloc:
+                # 图片 URL 写入文本，识图/发送类 tool 可直接从上下文取用
+                parts.append(f"[图片{': ' + str(summary) if summary else ''} {image_url}]")
+            else:
+                parts.append(f"[图片{': ' + str(summary) if summary else ''}]")
         elif segment_type == "at":
             parts.append(f"[@{data.get('qq', '未知用户')}]")
         elif segment_type == "reply":
@@ -195,9 +206,11 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
         is_at_self = any(
             str(at_id) == str(self_id) for at_id in at_info if at_id != "all"
         )
+        gid = int(group_id) if group_id is not None else 0
         if (
             sender_id is not None
             and str(sender_id) != str(self_id)
+            and is_interjection_enabled(gid)
             and random.random() < config.RANDOM_INTERJECTION_PROBABILITY
         ):
             try:
@@ -237,6 +250,16 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
 
             # @到自己
             if is_at_self:
+                # @ 回复已被 /shutdown -at 关闭：仅记背景与日志，不回复
+                if not is_at_reply_enabled(gid):
+                    append_background_message(
+                        gid,
+                        int(event_time),
+                        "【群聊背景消息：被 @ 但 @ 回复已关闭】\n"
+                        f"发送者: {sender_name or '未知群成员'} (QQ: {sender_id or '未知'})\n"
+                        f"内容: {_format_message_content(segments)}",
+                    )
+                    return
                 # await interaction.set_msg_emoji_like(msg_id, websocket)
                 await interaction.set_msg_emoji_like2(msg_id, websocket)
                 reply_id = _extract_reply_message_id(

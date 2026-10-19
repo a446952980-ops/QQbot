@@ -25,6 +25,9 @@ TIMED_MODE_DEFAULT_MINUTES = 10
 
 # ---- 群级服务开关（/shutdown 关闭、/startup 恢复；服务重启后默认全部开启） ----
 _DISABLED_GROUPS: set[int] = set()
+# 分级关闭：仅关闭被 @ 回复（/shutdown -at）或仅关闭随机插话（/shutdown -rd）
+_AT_DISABLED_GROUPS: set[int] = set()
+_RD_DISABLED_GROUPS: set[int] = set()
 
 
 def is_group_enabled(group_id: int) -> bool:
@@ -37,6 +40,16 @@ def set_group_enabled(group_id: int, enabled: bool) -> None:
         _DISABLED_GROUPS.discard(int(group_id))
     else:
         _DISABLED_GROUPS.add(int(group_id))
+
+
+def is_at_reply_enabled(group_id: int) -> bool:
+    """该群被 @ 时的回复逻辑是否开启（/shutdown -at 关闭）。"""
+    return int(group_id) not in _AT_DISABLED_GROUPS
+
+
+def is_interjection_enabled(group_id: int) -> bool:
+    """该群随机插话是否开启（/shutdown -rd 关闭）。"""
+    return int(group_id) not in _RD_DISABLED_GROUPS
 
 
 class GroupCommand(str, Enum):
@@ -157,25 +170,46 @@ async def _handle_shutdown(
     arg: str | None, *, group_id: int, websocket: ClientConnection
 ) -> bool:
     """/shutdown：仅在本群停止处理消息（仍接收并记日志），/startup 可恢复；
-    同时强行终止本群进行中的模型调用"""
+    可选 -at 仅关闭被 @ 回复、-rd 仅关闭随机插话（可组合，任意顺序，无重复）；
+    不带参数为整体关闭。同时强行终止本群进行中的模型调用"""
+    at = rd = False
     if arg is not None:
-        return False  # 带了任何参数都不触发
-    set_group_enabled(group_id, False)
+        tokens = arg.split()
+        if (
+            not tokens
+            or any(token not in ("-at", "-rd") for token in tokens)
+            or len(set(tokens)) != len(tokens)
+        ):
+            return False  # 传参错误：不触发，按普通消息处理
+        at = "-at" in tokens
+        rd = "-rd" in tokens
     cancelled = cancel_group_invocations(group_id)
     suffix = f"（{cancelled}）" if cancelled else ""
-    await interaction.send_group_msg(
-        group_id, f"睡觉喽{suffix}", websocket
-    )
+    if not at and not rd:
+        set_group_enabled(group_id, False)
+        text = f"睡觉喽{suffix}"
+    else:
+        if at:
+            _AT_DISABLED_GROUPS.add(int(group_id))
+        if rd:
+            _RD_DISABLED_GROUPS.add(int(group_id))
+        scope = "、".join(
+            label for label, on in (("at", at), ("rd", rd)) if on
+        )
+        text = f"睡觉喽({suffix}{scope})"
+    await interaction.send_group_msg(group_id, text, websocket)
     return True
 
 
 async def _handle_startup(
     arg: str | None, *, group_id: int, websocket: ClientConnection
 ) -> bool:
-    """/startup：恢复本群的消息处理"""
+    """/startup：恢复本群的消息处理（含被 -at / -rd 分级关闭的部分）"""
     if arg is not None:
         return False  # 带了任何参数都不触发
     set_group_enabled(group_id, True)
+    _AT_DISABLED_GROUPS.discard(int(group_id))
+    _RD_DISABLED_GROUPS.discard(int(group_id))
     await interaction.send_group_msg(group_id, "醒了", websocket)
     return True
 
@@ -233,9 +267,11 @@ async def try_handle_group_command(
             return False  # --empty 至多出现一次
         empty = True
         rest = [token for token in rest if token != "--empty"]
-    if len(rest) > 1:
-        return False
+    if len(rest) > 1 and command is not GroupCommand.SHUTDOWN:
+        return False  # /shutdown 除外：支持 “-at -rd” 组合传参
     arg = rest[0] if rest else None
+    if command is GroupCommand.SHUTDOWN and len(rest) > 1:
+        arg = " ".join(rest)
     if empty and command not in _MODE_COMMANDS:
         return False  # --empty 仅 mode 切换类指令支持
     if command in _MODE_COMMANDS:

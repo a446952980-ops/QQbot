@@ -6,6 +6,7 @@ from datetime import datetime
 import asyncio
 import json
 import random
+import time
 
 from langchain.tools import tool
 from langchain_core.messages import HumanMessage
@@ -17,6 +18,7 @@ from ..action import interaction
 from ..qq_ws_context import current_qq_websocket
 from ..tts.client import synthesize_to_mp3 as _tts_synthesize_to_mp3
 from . import aliyun_image_gen, volces_image_gen
+from .conversation_history import append_background_message
 
 # 生图平台按 config.IMAGE_GEN_PLATFORM 分发（aliyun / volc），同签名可互换
 _IMAGE_GENERATOR = (
@@ -33,6 +35,8 @@ tavily_client = AsyncTavilyClient(config.TAVILY_KEY)
 current_group_id: ContextVar[int | None] = ContextVar("current_group_id", default=None)
 current_sender_id: ContextVar[int | None] = ContextVar("current_sender_id", default=None)
 current_image_urls: ContextVar[tuple[str, ...]] = ContextVar("current_image_urls", default=())
+# 是否处于被 @ 回复流程：@ 轮次的 tool 发送文本已并入 turn 上下文，不再重复写 background
+_in_at_flow: ContextVar[bool] = ContextVar("in_at_flow", default=False)
 
 # 供 analyze_images 使用的视觉模型；未配置 VISION_MODEL 时退回默认模型
 _vision_llm = ChatOpenAI(
@@ -63,6 +67,25 @@ _EMOTION_FACE_TOOL_DESCRIPTION = (
 )
 
 
+# 单次模型调用内 qq_send_group_msg 的次数限制。
+# 注意：langchain 在拷贝的子上下文中执行工具协程，ContextVar.set() 不回传；
+# 因此这里持一个共享可变列表 [count]，由 ainvoke 入口重置为 [0]，
+# 工具内原地修改，父上下文下次调用可见。
+_send_msg_state: ContextVar[list | None] = ContextVar("send_msg_state", default=None)
+_SEND_WARN_AT = 10       # 第 10、11 次：照常发送，但返回即将禁用的警告
+_SEND_DISABLE_AT = 12    # 第 12、13 次：禁用发送，仅返回禁用提示
+_SEND_TERMINATE_AT = 14  # 第 14 次起：强制终止本次模型调用任务，群发【Ended】
+
+
+def _bump_send_count() -> int:
+    state = _send_msg_state.get()
+    if state is None:
+        state = [0]
+        _send_msg_state.set(state)
+    state[0] += 1
+    return state[0]
+
+
 @tool
 async def qq_send_group_msg(group_id: int, text: str) -> str:
     """
@@ -70,10 +93,39 @@ async def qq_send_group_msg(group_id: int, text: str) -> str:
     When preparing a long response, you MUST send its preceding sentences or paragraphs through separate tool calls, in their intended order, leaving only the final sentence or paragraph to be delivered directly by the model's final response. Never send the final paragraph through this tool.
     Each call sends one message of 1–2 short sentences. For @-replies, the final response MUST contain only new text; never repeat, quote, concatenate, or paraphrase anything already sent through this tool. The same rule applies to pre-search/crawl status messages.
     """
+    count = _bump_send_count()
+    if count >= _SEND_TERMINATE_AT:
+        # 次数超限：发【Ended】后强制终止当前模型调用任务（CancelledError 在
+        # agent 下一个 await 点抛出，沿调用链向上传播结束本次调用）
+        await interaction.send_group_msg(group_id, "【Ended】")
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            current_task.cancel()
+        return "【Ended】"
+    if count >= _SEND_DISABLE_AT:
+        return (
+            "The execution logic of this tool has been disabled for the current "
+            "model invocation. Stop tool calls immediately and return a concise "
+            "final model output."
+        )
     try:
         await interaction.send_group_msg(group_id, text)
     except RuntimeError as e:
         return f"Failed: {e}"
+    # @ 回复流程的发送文本已并入 turn 上下文，不重复写 background；
+    # 其他逻辑链（如定时群发）发送的内容进 background，标明是自己说的话
+    if not _in_at_flow.get():
+        append_background_message(
+            int(group_id),
+            int(time.time()),
+            "【自己发送的消息：通过工具主动发出】\n"
+            f"内容: {text.strip()}",
+        )
+    if count >= _SEND_WARN_AT:
+        return (
+            "Due to frequent calls, this tool is about to be disabled. Stop "
+            "repetitive sending immediately and finish with a concise final output."
+        )
     return "Plain group message sent."
 
 
@@ -149,6 +201,9 @@ async def analyze_images(urls: list[str], prompt: str | None = None) -> str:
     结合联网搜索结果判断图片出处等）时可用 prompt 自定义。
     适用场景：群里给出图片链接，或 search / search_images / crawl_website /
     scrape_website 联网检索得到图片 URL 后需要了解图片内容时。
+    群友发送过的图片 URL 也以「[图片 ... URL]」形式存放在会话上下文中
+    （被 @ 的消息、background 历史与引用消息里都有）；当你想了解历史上下文中
+    某张或某些图片的内容时，可直接从上下文取出对应 URL 主动调用本工具识别。
     仅返回文字描述，不会发送任何内容到群聊。
     """
     if not urls:
@@ -251,12 +306,10 @@ async def qq_send_group_msg_voice(group_id: int, text: str) -> str:
     return "OK"
 
 
-_IMAGE_TOOL_COMMON = """后台生图，不阻塞当前对话，仅支持群聊被 @ 场景。
+_IMAGE_TOOL_COMMON = """生图工具，仅支持群聊被 @ 场景。
 当前 @ 消息及其引用消息里的图片（最多 3 张）自动作为参考图传入，无需传参；
 仅需 prompt 描述要生成的图片（涉及参考图时用 "Image 1 / Image 2" 指代）。
-调用后任务立即提交、图片尚未生成：完成后所有生成图片会自动发到本群并
-@ 发起请求的用户；失败只记录终端日志。
-收到本工具返回后，必须告知用户图片正在生成中、稍后自动送达，不得说已生成完成。"""
+"""
 
 if config.IMAGE_GEN_PLATFORM == "volc":
     _GENERATE_IMAGE_DOC = f"""使用火山方舟 Seedream 生图，不依赖参考图也可纯文生图。
@@ -297,6 +350,15 @@ _generate_image.__doc__ = _GENERATE_IMAGE_DOC
 generate_image = tool(_generate_image)
 
 
+def _log_image_task_result(result: str, args: dict) -> None:
+    """生图后台任务的结局写入 tool_calls.log（受 tool 日志开关控制）。"""
+    if _tool_log_enabled:
+        try:
+            _log_tool_call("generate_image[后台任务]", args, result)
+        except Exception as e:
+            print(f"记录工具调用日志出错: {e}")
+
+
 async def _run_image_generation(
     group_id: int,
     sender_id: int | None,
@@ -304,10 +366,14 @@ async def _run_image_generation(
     reference_urls: tuple[str, ...],
     websocket,
 ) -> None:
+    prompt_preview = {"prompt": prompt, "reference_urls": list(reference_urls)}
     try:
         urls = await _IMAGE_GENERATOR(prompt, reference_urls)
-    except Exception as error:  # 生图报错只记终端日志，不打扰群聊
+    except Exception as error:  # 生图报错只记日志，不打扰群聊
         print(f"生图任务失败 group_id={group_id} prompt={prompt!r}: {error}")
+        _log_image_task_result(
+            f"<生图失败: {type(error).__name__}: {error}>", prompt_preview
+        )
         return
     try:
         await interaction.send_group_msg_image(
@@ -315,6 +381,16 @@ async def _run_image_generation(
         )
     except Exception as error:
         print(f"生图结果发送失败 group_id={group_id}: {error}")
+        _log_image_task_result(
+            f"<发送失败（已生成 {len(urls)} 张: {list(urls)}）: "
+            f"{type(error).__name__}: {error}>",
+            prompt_preview,
+        )
+        return
+    _log_image_task_result(
+        f"后台生成完成并已发送 {len(urls)} 张图（@{sender_id}）: {list(urls)}",
+        prompt_preview,
+    )
 
 
 async def _serper_post(endpoint: str, payload: dict) -> dict:
@@ -423,20 +499,42 @@ def toggle_tool_logging() -> bool:
     return _tool_log_enabled
 
 
+def _sanitize_log_text(text: str) -> str:
+    """净洗日志文本：转义异常行终止符（LS/PS/NEL/CR），替换无法编码的孤立代理字符。
+
+    模型生成的文本偶发含 U+2028/U+2029 等异常行终止符，会触发编辑器
+    “文件包含异常行终止符”警告；孤立代理字符则会在 utf-8 写入时抛
+    UnicodeEncodeError 导致该条日志丢失。统一在此处理。
+    """
+    for ch, esc in (
+        ("\u2028", "\\u2028"),
+        ("\u2029", "\\u2029"),
+        ("\u0085", "\\u0085"),
+        ("\r", "\\r"),
+    ):
+        text = text.replace(ch, esc)
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        text = text.encode("utf-8", "replace").decode("utf-8")
+    return text
+
+
 def _log_tool_call(tool_name: str, args: dict, result: object) -> None:
     def _fmt(value: object) -> str:
         try:
             return json.dumps(value, ensure_ascii=False)
-        except TypeError:
+        except (TypeError, ValueError):
             return repr(value)
 
+    entry = (
+        f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] "
+        f"tool={tool_name}\n"
+        f"args: {_fmt(args)}\n"
+        f"result: {_fmt(result)}\n\n"
+    )
     with open(TOOL_LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(
-            f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] "
-            f"tool={tool_name}\n"
-            f"args: {_fmt(args)}\n"
-            f"result: {_fmt(result)}\n\n"
-        )
+        f.write(_sanitize_log_text(entry))
 
 
 def _wrap_with_tool_logging(tool_obj):
@@ -444,17 +542,33 @@ def _wrap_with_tool_logging(tool_obj):
     original = tool_obj.coroutine
     if original is None:
         return tool_obj
+    # 同一工具对象可能同时出现在多个工具列表（如 qq_send_group_msg），
+    # 避免重复包装导致一次调用写多条日志
+    if getattr(tool_obj, "_tool_logging_wrapped", False):
+        return tool_obj
 
     async def logged(**kwargs):
-        result = await original(**kwargs)
-        if _tool_log_enabled:
+        def _write(outcome: str) -> None:
+            if not _tool_log_enabled:
+                return
             try:
-                _log_tool_call(tool_obj.name, kwargs, result)
+                _log_tool_call(tool_obj.name, kwargs, outcome)
             except Exception as e:
                 print(f"记录工具调用日志出错: {e}")
+
+        try:
+            result = await original(**kwargs)
+        except asyncio.CancelledError:
+            _write("<CancelledError: 调用被强行终止>")
+            raise
+        except Exception as e:
+            _write(f"<Exception: {type(e).__name__}: {e}>")
+            raise
+        _write(result)
         return result
 
     tool_obj.coroutine = logged
+    tool_obj._tool_logging_wrapped = True
     return tool_obj
 
 
