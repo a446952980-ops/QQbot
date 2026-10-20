@@ -5,6 +5,7 @@ from contextvars import ContextVar
 from datetime import datetime
 import asyncio
 import json
+import os
 import random
 import time
 
@@ -87,11 +88,19 @@ def _bump_send_count() -> int:
 
 
 @tool
-async def qq_send_group_msg(group_id: int, text: str) -> str:
+async def qq_send_group_msg(
+    group_id: int, text: str, at: str | None = None
+) -> str:
     """
     Send exactly one standalone plain-text message to a QQ group (not a reply). This tool is strictly for pre-final messages, never for sending the final answer or its正文.
     When preparing a long response, you MUST send its preceding sentences or paragraphs through separate tool calls, in their intended order, leaving only the final sentence or paragraph to be delivered directly by the model's final response. Never send the final paragraph through this tool.
     Each call sends one message of 1–2 short sentences. For @-replies, the final response MUST contain only new text; never repeat, quote, concatenate, or paraphrase anything already sent through this tool. The same rule applies to pre-search/crawl status messages.
+    Optional `at`: prepend an @ segment before the text. Value MUST be "all" (@全体成员) or a plain-digit QQ number; anything else is rejected without sending. Only use it when @-ing that member (or everyone) is genuinely necessary.
+
+    Args:
+        group_id: 目标群号。
+        text: 要发送的文本（1-2 句）。
+        at: 可选，"all"（@全体成员）或对方 QQ 号（纯数字），插在文本最前。
     """
     count = _bump_send_count()
     if count >= _SEND_TERMINATE_AT:
@@ -108,8 +117,13 @@ async def qq_send_group_msg(group_id: int, text: str) -> str:
             "model invocation. Stop tool calls immediately and return a concise "
             "final model output."
         )
+    at_value: str | None = None
+    if at is not None:
+        at_value = str(at).strip()
+        if at_value != "all" and not at_value.isdigit():
+            return "Failed: at 参数仅支持 QQ 号（纯数字）或 'all'。"
     try:
-        await interaction.send_group_msg(group_id, text)
+        await interaction.send_group_msg(group_id, text, at=at_value)
     except RuntimeError as e:
         return f"Failed: {e}"
     # @ 回复流程的发送文本已并入 turn 上下文，不重复写 background；
@@ -126,7 +140,7 @@ async def qq_send_group_msg(group_id: int, text: str) -> str:
             "Due to frequent calls, this tool is about to be disabled. Stop "
             "repetitive sending immediately and finish with a concise final output."
         )
-    return "Plain group message sent."
+    return f"Plain group message sent，you've sent {count} times. You can't get a reply before stopping calling this tool so stop at a reasonable time."
 
 
 @tool
@@ -179,6 +193,36 @@ async def qq_send_group_emotion_face2(group_id: int) -> str:
 
 
 @tool
+async def qq_group_poke(group_id: int, user_id: int) -> str:
+    """
+    Poke a group member (戳一戳) — a wordless, lightweight nudge.
+    Reach for it occasionally, not as a default greeting and not as a way to
+    get attention before speaking.
+
+    Good: playful teasing after a joke lands, acknowledging someone right
+    after an @ or an interjection, a quick "I saw that" when words would feel
+    heavier than the gesture.
+    Bad: the same member twice in a row, as a substitute for an actual reply,
+    to force a reaction out of silence, or when the mood is serious.
+
+    One poke per turn at most. After an @ via `qq_send_group_msg`, a poke is
+    redundant. Don't poke yourself or the whole group.
+
+    user_id is the member's plain-digit QQ number (never "all"; @-ing is done
+    via the `at` parameter of `qq_send_group_msg` instead).
+
+    Args:
+        group_id: 目标群号。
+        user_id: 要戳的群成员 QQ 号（纯数字）。
+    """
+    try:
+        await interaction.group_poke(group_id, user_id)
+    except RuntimeError as e:
+        return f"Failed: {e}"
+    return f"Poked user {user_id} in group {group_id}."
+
+
+@tool
 async def qq_send_group_msg_image(group_id: int, url: str) -> str:
     """
     根据已知的图片 URL 直接发送图片到群聊。
@@ -196,15 +240,23 @@ async def qq_send_group_msg_image(group_id: int, url: str) -> str:
 @tool
 async def analyze_images(urls: list[str], prompt: str | None = None) -> str:
     """
-    识别一张或多张图片（传入图片 URL），由 VISION_MODEL 分析后返回文字描述。
-    默认提示词为「描述图片内容」；需要特定识别目标（如提取图中文字、辨认物体/人物、
-    结合联网搜索结果判断图片出处等）时可用 prompt 自定义。
-    适用场景：群里给出图片链接，或 search / search_images / crawl_website /
-    scrape_website 联网检索得到图片 URL 后需要了解图片内容时。
-    群友发送过的图片 URL 也以「[图片 ... URL]」形式存放在会话上下文中
-    （被 @ 的消息、background 历史与引用消息里都有）；当你想了解历史上下文中
-    某张或某些图片的内容时，可直接从上下文取出对应 URL 主动调用本工具识别。
-    仅返回文字描述，不会发送任何内容到群聊。
+    看一眼一张或多张图片（传入 URL），返回 VISION_MODEL 的文字描述。
+    调用本工具就像扫一眼图片，是内部动作，不需要在群聊里声明“我看看”
+    “看完了”或“图里是……”，直接基于描述接话或决定发不发即可。
+    默认描述图片内容；需要特定识别目标（提取图中文字、辨认物体/人物、
+    结合联网结果判断出处等）时用 prompt 自定义。
+
+    需要看一眼的场景：对图片内容不确定、仅凭「[图片 ... URL]」的 summary
+    判断不了、群友想了解某张图、或你的接话/插话可能和上下文里某张图有关。
+    不要反问群友“这张图是什么”，也不要没看就猜或编图片内容。
+    可用来源（均无需询问群友）：当前消息和引用消息里的图；上下文历史图片
+    （被 @ 的消息、background 与引用消息以「[图片 ... URL]」存放，按需取
+    URL）；search / search_images / crawl_website / scrape_website 得到的
+    图片链接。
+
+    只返回文字描述，不发送任何内容到群聊。识图本身不是发言，看完觉得
+    没意思可以沉默，觉得有意思再决定要不要发、发哪张。
+    仅本工具不受调用次数限制；其他工具的次数限制不影响对它的调用。
     """
     if not urls:
         return "Failed: 未提供图片 URL。"
@@ -303,6 +355,74 @@ async def qq_send_group_msg_voice(group_id: int, text: str) -> str:
         await interaction.send_group_msg_record(group_id, mp3_path)
     except Exception as e:
         return f"Failed: 语音发送失败 {e}"
+    return "OK"
+
+
+_QZONE_QUOTA_PATH = "data/qzone_quota.json"
+_QZONE_DAILY_LIMIT = 3
+
+
+def _qzone_quota_left() -> int:
+    """当天剩余说额度（data/qzone_quota.json 记录当日已发表次数）。"""
+    try:
+        with open(_QZONE_QUOTA_PATH, encoding="utf-8") as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        record = {}
+    today = time.strftime("%Y-%m-%d")
+    if record.get("date") != today:
+        return _QZONE_DAILY_LIMIT
+    return max(0, _QZONE_DAILY_LIMIT - int(record.get("count", 0)))
+
+
+def _qzone_quota_consume() -> None:
+    today = time.strftime("%Y-%m-%d")
+    try:
+        with open(_QZONE_QUOTA_PATH, encoding="utf-8") as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        record = {}
+    count = int(record.get("count", 0)) if record.get("date") == today else 0
+    record = {"date": today, "count": count + 1}
+    tmp_path = _QZONE_QUOTA_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(record, f, ensure_ascii=False)
+    os.replace(tmp_path, _QZONE_QUOTA_PATH)
+
+
+@tool
+async def qq_send_qzone_msg(content: str, images: list[str] | None = None) -> str:
+    """
+    发表一条 QQ 空间说说（低频主动行为，当天最多 3 条，超出会被拒绝）。
+    仅用于分享真正值得记录的内容：有趣/意外的新发现、值得纪念的事、
+    刚在群里聊出的话题延展。MUST NOT 为了打发时间、凑次数或刷存在感而发；
+    发之前先确认「这条内容现在不发给好友看会可惜吗」，答案是否定的就不要发。
+    两次发表之间应自然间隔一段时间，MUST NOT 连续发表。
+    content 用自己的口吻写（符合当前人设），1-3 句话；images 可选，
+    传 0-3 张图片 URL（来自 search_images / 群聊上下文），纯文字则留空。
+    发表成功返回 OK，失败返回 Failed 原因。
+
+    Args:
+        content: 说说正文（自己的口吻）。
+        images: 可选，随说附带的图片 URL 列表。
+    """
+    content = (content or "").strip()
+    if not content:
+        return "Failed: 未提供说说内容。"
+    if _qzone_quota_left() <= 0:
+        return (
+            "Failed: Daily limit reached (3 posts per day). Do not attempt to "
+            "post again until tomorrow."
+        )
+    valid_images = [
+        url for url in (images or [])
+        if isinstance(url, str) and url.startswith(("http://", "https://"))
+    ]
+    try:
+        await interaction.send_qzone_msg(content, valid_images)
+    except Exception as e:
+        return f"Failed: {e}"
+    _qzone_quota_consume()
     return "OK"
 
 
@@ -468,14 +588,16 @@ tools_lst = [
     qq_send_group_msg,
     # qq_send_group_ai_record,
     qq_send_group_emotion_face2,
+    qq_group_poke,
     qq_send_group_msg_image,
     qq_send_group_msg_voice,
+    qq_send_qzone_msg,
     search,
-    crawl_website,
+    # crawl_website,
     scrape_website,
     search_images,
     analyze_images,
-    generate_image,
+    # generate_image,
 ]
 
 # Random interjections only need tools that visibly post to the group.
@@ -483,7 +605,52 @@ interjection_tools_lst = [
     qq_send_group_msg,
     qq_send_group_msg_voice,
     # qq_send_group_ai_record,
+    analyze_images,
     qq_send_group_emotion_face2,
+    qq_group_poke,
+]
+
+# ---- 新鲜事插话事件：可多次调用工具（总次数 5 次，超出禁用） ----
+_fresh_call_state: ContextVar[list | None] = ContextVar("fresh_call_state", default=None)
+_FRESH_TOOL_CALL_CAP = 5
+
+
+def _wrap_with_call_cap(tool_obj, cap: int):
+    """包装工具：本次插话内第 cap+1 次调用起直接返回禁用提示，不执行。"""
+    original = tool_obj.coroutine
+
+    async def capped(**kwargs):
+        state = _fresh_call_state.get()
+        if state is None:
+            state = [0]
+            _fresh_call_state.set(state)
+        state[0] += 1
+        if state[0] > cap:
+            return (
+                "Tool call limit for this fresh-news interjection has been "
+                f"reached ({cap} calls). Stop calling tools immediately and "
+                "share what you have with one final concise group message."
+            )
+        return await original(**kwargs)
+
+    tool_obj.coroutine = capped
+    return tool_obj
+
+
+fresh_tools_lst = [
+    qq_send_group_msg,
+    qq_send_group_msg_voice,
+    qq_send_group_emotion_face2,
+    # qq_group_poke,
+    qq_send_qzone_msg,
+    search,
+    search_images,
+    scrape_website,
+    analyze_images,  # 识图不受次数限制（见其注释），豁免调用上限
+]
+fresh_tools_lst = [
+    t if t is analyze_images else _wrap_with_call_cap(t, _FRESH_TOOL_CALL_CAP)
+    for t in fresh_tools_lst
 ]
 
 
@@ -574,3 +741,4 @@ def _wrap_with_tool_logging(tool_obj):
 
 tools_lst = [_wrap_with_tool_logging(t) for t in tools_lst]
 interjection_tools_lst = [_wrap_with_tool_logging(t) for t in interjection_tools_lst]
+fresh_tools_lst = [_wrap_with_tool_logging(t) for t in fresh_tools_lst]

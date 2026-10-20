@@ -29,7 +29,7 @@ async def _run_broadcast_for_group(
     )
     body = extract_final_assistant_text(result.get("messages", []))
     for segment in interaction.split_message_segments(body):
-        await interaction.send_group_msg(group_id, segment, websocket)
+        await interaction.send_group_msg(group_id, segment, websocket=websocket)
 
 
 async def run_scheduled_broadcast(
@@ -57,7 +57,7 @@ async def run_scheduled_broadcast(
                 if _is_rate_limit_error(error):
                     try:
                         await interaction.send_group_msg(
-                            gid, _RATE_LIMIT_REPLY_TEXT, websocket
+                            gid, _RATE_LIMIT_REPLY_TEXT, websocket=websocket
                         )
                     except Exception as send_error:
                         print(f"发送限流提示失败 group_id={gid}: {send_error}")

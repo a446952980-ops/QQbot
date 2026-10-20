@@ -3,6 +3,7 @@ import json
 import random
 import re
 from collections.abc import Sequence
+from contextvars import ContextVar
 from pathlib import Path
 
 import config
@@ -11,6 +12,14 @@ from websockets.asyncio.client import ClientConnection
 from ..qq_ws_context import current_qq_websocket
 from .napcat_api import request_napcat_api
 from .ws_sender import send_ws_event
+
+# 最近一次群消息事件里上报的机器人自身 QQ（合并转发自定义节点显示用）
+_bot_self_id: ContextVar[str | None] = ContextVar("bot_self_id", default=None)
+
+
+def set_bot_self_id(self_id: str) -> None:
+    """记录机器人自身 QQ（message 事件入口调用）。"""
+    _bot_self_id.set(self_id)
 
 
 def _resolve_ws(websocket: ClientConnection | None) -> ClientConnection:
@@ -116,12 +125,23 @@ async def set_group_sign(
 
 
 async def send_group_msg(
-    group_id: int, text: str, websocket: ClientConnection | None = None
+    group_id: int,
+    text: str,
+    at: str | None = None,
+    websocket: ClientConnection | None = None,
 ):
     """
-    发送群聊文本消息
+    发送群聊文本消息；at 传 QQ 号或 "all" 时在文本前插入 at 消息段
     """
     ws = _resolve_ws(websocket)
+    if at is not None and not isinstance(at, (str, int)):
+        # 防御：误把 websocket 等对象按位置传进 at 时忽略，避免拼出无效 at 段
+        print(f"send_group_msg 收到非法 at 参数（已忽略）: {type(at).__name__}")
+        at = None
+    message = []
+    if at is not None:
+        message.append({"type": "at", "data": {"qq": str(at)}})
+    message.append({"type": "text", "data": {"text": text}})
     await send_ws_event(
         ws,
         json.dumps(
@@ -129,19 +149,61 @@ async def send_group_msg(
                 "action": "send_group_msg",
                 "params": {
                     "group_id": group_id,
-                    "message": [
-                        {
-                            "type": "text",
-                            "data": {
-                                "text": text
-                            }
-                        },
-                    ]
-                }
+                    "message": message,
+                },
+            }
+        ),
+    )
+    print(f"在 {group_id} 发送了消息")
+
+
+async def group_poke(
+    group_id: int,
+    user_id: int,
+    websocket: ClientConnection | None = None,
+):
+    """
+    发送群戳一戳（ws 事件 group_poke）
+    """
+    ws = _resolve_ws(websocket)
+    await send_ws_event(
+        ws,
+        json.dumps(
+            {
+                "action": "group_poke",
+                "params": {"group_id": str(group_id), "user_id": str(user_id)},
+            }
+        ),
+    )
+    print(f"已戳群 {group_id} 的 {user_id}")
+
+
+async def send_qzone_msg(
+    content: str,
+    images: list[str] | None = None,
+    ugc_right: int = 1,
+    target_uins: list[int] | None = None,
+    websocket: ClientConnection | None = None,
+):
+    """
+    发表 QQ 空间说说（ws 事件 send_qzone_msg）
+    """
+    ws = _resolve_ws(websocket)
+    await send_ws_event(
+        ws,
+        json.dumps(
+            {
+                "action": "send_qzone_msg",
+                "params": {
+                    "content": content,
+                    "images": list(images) if images else [],
+                    "ugc_right": ugc_right,
+                    "target_uins": list(target_uins) if target_uins else [],
+                },
             }
         )
     )
-    print(f"在 {group_id} 发送了消息")
+    print(f"已发表说说: {content[:50]}")
 
 
 async def send_group_ai_record(
@@ -202,6 +264,40 @@ async def send_group_msg_reply(
         )
     )
     print(f"回复了 {msg_id} 消息")
+
+
+async def send_group_forward_msg(
+    group_id: int,
+    texts: Sequence[str],
+    websocket: ClientConnection | None = None,
+):
+    """
+    以合并转发消息（自定义节点）发送多条文本到群聊
+    （NapCat ws 事件 send_forward_msg；节点 user_id 优先用机器人自身 QQ）
+    """
+    ws = _resolve_ws(websocket)
+    bot_id = _bot_self_id.get()
+    nodes = [
+        {
+            "type": "node",
+            "data": {
+                "user_id": str(bot_id) if bot_id else "10000",
+                "nickname": "思考过程",
+                "content": [{"type": "text", "data": {"text": text}}],
+            },
+        }
+        for text in texts
+    ]
+    await send_ws_event(
+        ws,
+        json.dumps(
+            {
+                "action": "send_forward_msg",
+                "params": {"group_id": str(group_id), "message": nodes},
+            }
+        ),
+    )
+    print(f"已在 {group_id} 发送合并转发消息（{len(nodes)} 个节点）")
 
 
 async def send_group_msg_record(

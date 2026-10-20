@@ -203,6 +203,8 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
             if segment.get("type") == "at" and isinstance(segment.get("data"), dict)
         ]
         self_id = event_data.get("self_id")
+        if self_id:
+            interaction.set_bot_self_id(str(self_id))
         is_at_self = any(
             str(at_id) == str(self_id) for at_id in at_info if at_id != "all"
         )
@@ -213,25 +215,35 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
             and is_interjection_enabled(gid)
             and random.random() < config.RANDOM_INTERJECTION_PROBABILITY
         ):
+            # 触发插话后按概率分流：新鲜事分享事件 / 普通插话事件
+            fresh_event = random.random() < config.INTERJECTION_FRESH_EVENT_PROB
+            interject_kwargs = dict(
+                group_id=int(group_id) if group_id is not None else 0,
+                group_name=group_name or "",
+                sender_name=sender_name or "",
+                sender_id=int(sender_id),
+                msg_id=int(msg_id) if msg_id is not None else 0,
+                text=_format_message_content(segments),
+                image_inputs=_extract_image_urls(segments, "当前消息中的图片"),
+            )
             try:
-                await default_group_agent.ainvoke_random_interjection(
-                    group_id=int(group_id) if group_id is not None else 0,
-                    group_name=group_name or "",
-                    sender_name=sender_name or "",
-                    sender_id=int(sender_id),
-                    msg_id=int(msg_id) if msg_id is not None else 0,
-                    text=_format_message_content(segments),
-                    image_inputs=_extract_image_urls(segments, "当前消息中的图片"),
-                )
+                if fresh_event:
+                    await default_group_agent.ainvoke_fresh_news_interjection(
+                        **interject_kwargs
+                    )
+                else:
+                    await default_group_agent.ainvoke_random_interjection(
+                        **interject_kwargs
+                    )
             except Exception as error:
                 print(f"随机插话执行失败: {error}")
                 gid = int(group_id) if group_id is not None else 0
                 if _is_rate_limit_error(error):
                     await interaction.send_group_msg(
-                        gid, _RATE_LIMIT_REPLY_TEXT, websocket
+                        gid, _RATE_LIMIT_REPLY_TEXT, websocket=websocket
                     )
                 elif _is_filtered_content_error(error):
-                    await interaction.send_group_msg(gid, _FILTERED_REPLY_TEXT, websocket)
+                    await interaction.send_group_msg(gid, _FILTERED_REPLY_TEXT, websocket=websocket)
         if not is_at_self:
             display_name = sender.get("card") or sender_name or "未知群成员"
             append_background_message(
@@ -314,7 +326,7 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
                         await interaction.send_group_msg(
                             int(group_id) if group_id is not None else 0,
                             _RATE_LIMIT_REPLY_TEXT,
-                            websocket,
+                            websocket=websocket,
                         )
                         return
                     if not _is_filtered_content_error(error):
@@ -334,7 +346,7 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
                     else:
                         # 换行分段：前面的段落走普通群消息按序排队发送，最后一段作为带 @ 的回复
                         for seg in segments[:-1]:
-                            await interaction.send_group_msg(group_id, seg, websocket)
+                            await interaction.send_group_msg(group_id, seg, websocket=websocket)
                         await interaction.send_group_msg_reply(
                             group_id, msg_id, segments[-1], websocket
                         )

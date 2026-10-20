@@ -18,7 +18,7 @@ from websockets.asyncio.client import ClientConnection
 
 from ..action import interaction
 from ..agent import conversation_history, group_prompt
-from ..agent.init_llm import cancel_group_invocations
+from ..agent.init_llm import cancel_group_invocations, default_group_agent
 
 TIMED_MODE_DEFAULT_MINUTES = 10
 
@@ -60,6 +60,7 @@ class GroupCommand(str, Enum):
     MODE_RESET = "/mode_reset"
     EMPTY = "/empty"
     STOP = "/stop"
+    THINKING = "/thinking"
     SHUTDOWN = "/shutdown"
     STARTUP = "/startup"
 
@@ -98,7 +99,7 @@ async def _handle_secret_mode(
         conversation_history.clear_group_turns(group_id)
     suffix = "，上下文已清空" if empty else ""
     await interaction.send_group_msg(
-        group_id, f"secret_mode 已在本群开启（{duration_desc}）{suffix}", websocket
+        group_id, f"secret_mode 已在本群开启（{duration_desc}）{suffix}", websocket=websocket
     )
     return True
 
@@ -114,7 +115,7 @@ async def _handle_smart_mode(
         conversation_history.clear_group_turns(group_id)
     suffix = "，上下文已清空" if empty else ""
     await interaction.send_group_msg(
-        group_id, f"smart_mode 已在本群开启（{duration_desc}）{suffix}", websocket
+        group_id, f"smart_mode 已在本群开启（{duration_desc}）{suffix}", websocket=websocket
     )
     return True
 
@@ -129,7 +130,7 @@ async def _handle_mode_reset(
     if empty:
         conversation_history.clear_group_turns(group_id)
     suffix = "，上下文已清空" if empty else ""
-    await interaction.send_group_msg(group_id, f"本群已恢复默认模式{suffix}", websocket)
+    await interaction.send_group_msg(group_id, f"本群已恢复默认模式{suffix}", websocket=websocket)
     return True
 
 
@@ -140,14 +141,31 @@ async def _handle_empty(
     if arg is None:
         conversation_history.clear_group_turns(group_id)
         await interaction.send_group_msg(
-            group_id, "本群上下文已清空（background 保留）", websocket
+            group_id, "本群上下文已清空（background 保留）", websocket=websocket
         )
         return True
     if arg == "-a":
         conversation_history.clear_group_all(group_id)
-        await interaction.send_group_msg(group_id, "本群全部上下文已清空", websocket)
+        await interaction.send_group_msg(group_id, "本群全部上下文已清空", websocket=websocket)
         return True
     return False  # 传参错误：不触发，按普通消息处理
+
+
+async def _handle_thinking(
+    arg: str | None, *, group_id: int, websocket: ClientConnection
+) -> bool:
+    """/thinking：切换主模型思考模式（全局，默认关闭）；开启后思维链写入 data/thinking.log"""
+    if arg is not None:
+        return False  # 带了任何参数都不触发
+    enabled = not default_group_agent.is_thinking_enabled()
+    default_group_agent.set_thinking_enabled(enabled)
+    text = (
+        "已开启 thinking 模式（思考过程记录到 thinking 日志）"
+        if enabled
+        else "已关闭 thinking 模式"
+    )
+    await interaction.send_group_msg(group_id, text, websocket=websocket)
+    return True
 
 
 async def _handle_stop(
@@ -162,7 +180,7 @@ async def _handle_stop(
         if count
         else "0"
     )
-    await interaction.send_group_msg(group_id, text, websocket)
+    await interaction.send_group_msg(group_id, text, websocket=websocket)
     return True
 
 
@@ -197,7 +215,7 @@ async def _handle_shutdown(
             label for label, on in (("at", at), ("rd", rd)) if on
         )
         text = f"睡觉喽({suffix}{scope})"
-    await interaction.send_group_msg(group_id, text, websocket)
+    await interaction.send_group_msg(group_id, text, websocket=websocket)
     return True
 
 
@@ -210,7 +228,7 @@ async def _handle_startup(
     set_group_enabled(group_id, True)
     _AT_DISABLED_GROUPS.discard(int(group_id))
     _RD_DISABLED_GROUPS.discard(int(group_id))
-    await interaction.send_group_msg(group_id, "醒了", websocket)
+    await interaction.send_group_msg(group_id, "醒了", websocket=websocket)
     return True
 
 
@@ -220,6 +238,7 @@ _COMMAND_HANDLERS: dict[GroupCommand, Callable[..., Awaitable[bool]]] = {
     GroupCommand.MODE_RESET: _handle_mode_reset,
     GroupCommand.EMPTY: _handle_empty,
     GroupCommand.STOP: _handle_stop,
+    GroupCommand.THINKING: _handle_thinking,
     GroupCommand.SHUTDOWN: _handle_shutdown,
     GroupCommand.STARTUP: _handle_startup,
 }
