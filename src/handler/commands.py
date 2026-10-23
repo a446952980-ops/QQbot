@@ -160,9 +160,9 @@ async def _handle_thinking(
     enabled = not default_group_agent.is_thinking_enabled()
     default_group_agent.set_thinking_enabled(enabled)
     text = (
-        "已开启 thinking 模式（思考过程记录到 thinking 日志）"
+        "thinking on"
         if enabled
-        else "已关闭 thinking 模式"
+        else "thinking off"
     )
     await interaction.send_group_msg(group_id, text, websocket=websocket)
     return True

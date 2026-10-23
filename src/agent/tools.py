@@ -177,7 +177,15 @@ async def qq_send_group_emotion_face(group_id: int, face: str) -> str:
 
 @tool
 async def qq_send_group_emotion_face2(group_id: int) -> str:
-    """Send one randomly selected custom QQ face fetched live from NapCat."""
+    """发一个随机自定义 QQ 表情给群（图片形式，不占文字）。
+
+    这是“活人感”的可见节拍，不是要等情绪特别强烈才用的稀有道具：
+    - 无语、惊讶、开心、得意、嫌弃、心动、被冒犯、想吐槽时，都可以顺手发一个；
+    - 接梗、反撩、吐槽、夸人、认怂之后，可以配一个表情一起发；
+    - 一回合一个就够，别连续刷，也别用表情代替要说的正文。
+
+    常见用法：先发这个表情，再补一句短正文（或配合 qq_send_group_msg 带文字）。
+    """
     try:
         faces = await interaction.fetch_custom_faces(count=48)
         if not faces:
@@ -195,21 +203,10 @@ async def qq_send_group_emotion_face2(group_id: int) -> str:
 @tool
 async def qq_group_poke(group_id: int, user_id: int) -> str:
     """
-    Poke a group member (戳一戳) — a wordless, lightweight nudge.
-    Reach for it occasionally, not as a default greeting and not as a way to
-    get attention before speaking.
-
-    Good: playful teasing after a joke lands, acknowledging someone right
-    after an @ or an interjection, a quick "I saw that" when words would feel
-    heavier than the gesture.
-    Bad: the same member twice in a row, as a substitute for an actual reply,
-    to force a reaction out of silence, or when the mood is serious.
-
-    One poke per turn at most. After an @ via `qq_send_group_msg`, a poke is
-    redundant. Don't poke yourself or the whole group.
-
-    user_id is the member's plain-digit QQ number (never "all"; @-ing is done
-    via the `at` parameter of `qq_send_group_msg` instead).
+    戳一戳群里的某个人（轻量动手，不用说话）。
+    这是聊天手感的一部分，不是稀有动作：
+    - 玩笑落地后、接完梗、吐槽完、有人 @ 你之后、想表示“我在/我看到了”时，顺手戳一下；
+    - 只戳和当前对话有关的那个群友（sender_id 或 @ 的目标），别乱戳无关的人。
 
     Args:
         group_id: 目标群号。
@@ -279,7 +276,7 @@ async def analyze_images(urls: list[str], prompt: str | None = None) -> str:
 async def search(
     query: str,
     topic: Literal["general", "news", "finance"] = None,
-    time_range: Literal["day", "week", "month", "year"] = None,
+    time_range: Literal["day", "week", "month", "year"] = "week",
     include_domains: Sequence[str] = None,
     exclude_domains: Sequence[str] = None,
 ) -> dict:
@@ -289,10 +286,13 @@ async def search(
     web sources. Prefer `crawl_website` when deep multi-page exploration is needed;
     use `search_images` when looking for pictures instead of text.
 
+    默认只搜最近一周（time_range="week"）。如果一周内搜不到、结果太少或与问题无关，
+    再逐步扩大范围重搜："month"、"year"；不要一上来就用大范围。
+
     Args:
         query: Search query, e.g. "latest AI research papers 2025".
         topic: "news" for current events; "general" for broad searches; "finance" for markets.
-        time_range: Filter by recency: "day", "week", "month", or "year".
+        time_range: 默认 "week"（最近一周）。搜不到时再扩大到 "month" 或 "year"；确需更近可用 "day"。
         include_domains: Optional allowlist of domains (max 300).
         exclude_domains: Optional blocklist of domains (max 150).
     """
@@ -335,14 +335,13 @@ async def crawl_website(url: str, instructions: str) -> dict:
 @tool
 async def qq_send_group_msg_voice(group_id: int, text: str) -> str:
     """
-    把一段文字合成为语音，并以 QQ 语音消息发送到群聊。
-    适合念一段话、讲故事、温柔读消息等场景；语音在后台流式合成（mp3）
-    后自动发送，无需上传文件。
-    text 会被完整朗读：只传要说的内容，不要混入表情代码、图片链接或 markdown。
+    语音说一句话，并以 QQ 语音消息发送到群聊。
+    适合念一段话、讲故事、读消息等场景；
+    只传要说的内容，不要混入表情代码、图片链接或 markdown。
 
     Args:
         group_id: QQ group ID.
-        text: 要朗读的文字。
+        text: 语音读的文字。
     """
     text = (text or "").strip()
     if not text:
@@ -393,13 +392,13 @@ def _qzone_quota_consume() -> None:
 @tool
 async def qq_send_qzone_msg(content: str, images: list[str] | None = None) -> str:
     """
-    发表一条 QQ 空间说说（低频主动行为，当天最多 3 条，超出会被拒绝）。
-    仅用于分享真正值得记录的内容：有趣/意外的新发现、值得纪念的事、
-    刚在群里聊出的话题延展。MUST NOT 为了打发时间、凑次数或刷存在感而发；
-    发之前先确认「这条内容现在不发给好友看会可惜吗」，答案是否定的就不要发。
-    两次发表之间应自然间隔一段时间，MUST NOT 连续发表。
-    content 用自己的口吻写（符合当前人设），1-3 句话；images 可选，
-    传 0-3 张图片 URL（来自 search_images / 群聊上下文），纯文字则留空。
+    发表一条 QQ 空间说说（当天最多 3 条，超出会被拒绝）。
+    空间是你的朋友圈，不是群聊复述板：只在你自己产生真实反应时发——
+    一个离谱梗、一句想记住的吐槽、一张好笑的图、一段聊出共鸣的话。
+    判断标准是「我自己想发」，不是「够不够格」；想发就发，别硬憋，
+    但也别为了凑数硬发，两次之间间隔一下，别连续刷屏。
+    content 用自己的口吻写，1-3 句话；images可以
+    传 0-3 张图片 URL（来自 search_images / 群聊上下文）。
     发表成功返回 OK，失败返回 Failed 原因。
 
     Args:
@@ -608,6 +607,7 @@ interjection_tools_lst = [
     analyze_images,
     qq_send_group_emotion_face2,
     qq_group_poke,
+    qq_send_qzone_msg,
 ]
 
 # ---- 新鲜事插话事件：可多次调用工具（总次数 5 次，超出禁用） ----
@@ -641,7 +641,7 @@ fresh_tools_lst = [
     qq_send_group_msg,
     qq_send_group_msg_voice,
     qq_send_group_emotion_face2,
-    # qq_group_poke,
+    qq_group_poke,
     qq_send_qzone_msg,
     search,
     search_images,
