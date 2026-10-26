@@ -17,7 +17,7 @@ import config
 from websockets.asyncio.client import ClientConnection
 
 from ..action import interaction
-from ..agent import conversation_history, group_prompt
+from ..agent import conversation_history, group_prompt, tools
 from ..agent.init_llm import cancel_group_invocations, default_group_agent
 
 TIMED_MODE_DEFAULT_MINUTES = 10
@@ -64,6 +64,8 @@ class GroupCommand(str, Enum):
     COMPRESS = "/compress"
     SHUTDOWN = "/shutdown"
     STARTUP = "/startup"
+    MUSIC_ON = "/music_on"
+    MUSIC_OFF = "/music_off"
 
 
 def _apply_timed_mode(
@@ -251,6 +253,37 @@ async def _handle_startup(
     return True
 
 
+async def _handle_music_on(
+    arg: str | None, *, group_id: int, websocket: ClientConnection
+) -> bool:
+    """/music_on [-N]：开启本群音乐生成工具；N 为正整数时限 N 次，达到后自动关闭；无参数不限次数"""
+    if arg is None:
+        quota: int | None = None
+    elif arg.startswith("-") and arg[1:].isdigit() and int(arg[1:]) > 0:
+        quota = int(arg[1:])
+    else:
+        return False  # 传参错误：不触发，按普通消息处理
+    tools.set_music_enabled(int(group_id), quota)
+    text = (
+        "本群音乐tool启用"
+        if quota is None
+        else f"本群音乐tool启用（{quota}）"
+    )
+    await interaction.send_group_msg(group_id, text, websocket=websocket)
+    return True
+
+
+async def _handle_music_off(
+    arg: str | None, *, group_id: int, websocket: ClientConnection
+) -> bool:
+    """/music_off：关闭本群音乐生成工具"""
+    if arg is not None:
+        return False  # 带了任何参数都不触发
+    tools.set_music_disabled(int(group_id))
+    await interaction.send_group_msg(group_id, "本群音乐tool关闭", websocket=websocket)
+    return True
+
+
 _COMMAND_HANDLERS: dict[GroupCommand, Callable[..., Awaitable[bool]]] = {
     GroupCommand.SECRET_MODE: _handle_secret_mode,
     GroupCommand.SMART_MODE: _handle_smart_mode,
@@ -261,10 +294,17 @@ _COMMAND_HANDLERS: dict[GroupCommand, Callable[..., Awaitable[bool]]] = {
     GroupCommand.COMPRESS: _handle_compress,
     GroupCommand.SHUTDOWN: _handle_shutdown,
     GroupCommand.STARTUP: _handle_startup,
+    GroupCommand.MUSIC_ON: _handle_music_on,
+    GroupCommand.MUSIC_OFF: _handle_music_off,
 }
 
 # 仅管理员（config.ADMIN_QQ_IDS）可触发的指令
-_ADMIN_COMMANDS: set[GroupCommand] = {GroupCommand.SHUTDOWN, GroupCommand.STARTUP}
+_ADMIN_COMMANDS: set[GroupCommand] = {
+    GroupCommand.SHUTDOWN,
+    GroupCommand.STARTUP,
+    GroupCommand.MUSIC_ON,
+    GroupCommand.MUSIC_OFF,
+}
 
 # mode 切换类指令：额外支持可选参数 --empty（切换/重置时清空该群除 background 外的上下文）
 _MODE_COMMANDS: set[GroupCommand] = {

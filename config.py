@@ -69,6 +69,14 @@ VOLCES_IMAGE_MODEL = (
     os.getenv("VOLCES_IMAGE_MODEL") or "doubao-seedream-5-0-260128"
 ).strip()
 
+# ---- MusicAPI（Suno 风格）persona 音乐生成 ----
+# MUSIC_API_KEY: MusicAPI bearer token；MUSIC_API_PERSONA_ID: 虚拟歌手 persona_id
+MUSIC_API_KEY = (os.getenv("MUSIC_API_KEY") or "").strip()
+MUSIC_API_PERSONA_ID = (os.getenv("MUSIC_API_PERSONA_ID") or "").strip()
+MUSIC_API_BASE_URL = (
+    os.getenv("MUSIC_API_BASE_URL") or "https://api.musicapi.ai"
+).strip().rstrip("/")
+
 def _parse_int_list(raw: str) -> list[int]:
     ids: list[int] = []
     for part in raw.replace(";", ",").split(","):

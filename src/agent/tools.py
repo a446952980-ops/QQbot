@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import random
+import re
 import time
 
 from langchain.tools import tool
@@ -18,7 +19,7 @@ from tavily import AsyncTavilyClient
 from ..action import interaction
 from ..qq_ws_context import current_qq_websocket
 from ..tts.client import synthesize_to_mp3 as _tts_synthesize_to_mp3
-from . import aliyun_image_gen, volces_image_gen
+from . import aliyun_image_gen, sonic_music, volces_image_gen
 from .conversation_history import append_background_message
 
 # 生图平台按 config.IMAGE_GEN_PLATFORM 分发（aliyun / volc），同签名可互换
@@ -515,6 +516,255 @@ async def _run_image_generation(
     )
 
 
+_MUSIC_SUNG_TAG_RE = re.compile(r"\[[^\]]*\]")
+_MUSIC_HANZI_RE = re.compile(r"[\u4e00-\u9fff]")
+
+# ---- 群级音乐生成开关（/music_on [-N] 开启、/music_off 关闭；服务启动时默认全部关闭） ----
+# group_id -> 剩余可用次数；None 表示不限次数。不在表中的群 = 关闭。
+_MUSIC_ENABLED_GROUPS: dict[int, int | None] = {}
+
+
+def is_music_enabled(group_id: int) -> bool:
+    """该群是否已开启音乐生成工具（@ 流程动态注册 generate_music 的依据）。"""
+    return int(group_id) in _MUSIC_ENABLED_GROUPS
+
+
+def set_music_enabled(group_id: int, quota: int | None) -> None:
+    """开启某群音乐生成；quota 为剩余次数（None 不限）。"""
+    _MUSIC_ENABLED_GROUPS[int(group_id)] = quota
+
+
+def set_music_disabled(group_id: int) -> None:
+    _MUSIC_ENABLED_GROUPS.pop(int(group_id), None)
+
+
+def _consume_music_quota(group_id: int) -> int | None:
+    """成功提交一次音乐生成时扣减配额；归零自动关闭。返回扣减后剩余次数（None=不限/已关闭）。"""
+    gid = int(group_id)
+    remaining = _MUSIC_ENABLED_GROUPS.get(gid)
+    if remaining is None:
+        return None  # 不限次数或已关闭
+    remaining -= 1
+    if remaining <= 0:
+        _MUSIC_ENABLED_GROUPS.pop(gid, None)  # 达到次数自动置为 off
+        return 0
+    _MUSIC_ENABLED_GROUPS[gid] = remaining
+    return remaining
+
+
+def _count_sung_words(lyrics: str) -> int:
+    """"实际演唱"字数：去掉结构标签后，英文按词数 + 中文按字数（汉字逐个计）合并统计。"""
+    text = _MUSIC_SUNG_TAG_RE.sub(" ", lyrics)
+    english_words = re.findall(r"[A-Za-z0-9']+", text)
+    return len(english_words) + len(_MUSIC_HANZI_RE.findall(text))
+
+
+_MUSIC_TOOL_DOC = """用虚拟歌手音色（persona_music）AI 生成一首歌，仅支持群聊被 @ 场景。
+
+这是严格的自定义歌词模式：歌词会逐字唱出来，所以**词数和时长必须对得上、绝不能太短**。
+中英文歌词都支持（也可中英混排，但一段内尽量统一语言）。
+
+写词规范（Suno）：
+- 每段用结构标签单开一行分隔。常用标签不限于这些，按需选用、不必全用：
+  [Intro] / [Verse] / [Pre-Chorus] / [Chorus] / [Post-Chorus] / [Bridge] / [Hook] /
+  [Refrain] / [Interlude] / [Instrumental] / [Solo] / [Breakdown] / [Break] / [Drop] /
+  [Build] / [Outro] / [End] / [fade to end]。标签本身不唱、不计字数。
+- **时长下限 2 分半**：duration 必须 ≥ 150 秒（≤ 360）。去掉标签后「字数」必须 ≥ duration
+  （约 1 词或 1 字/秒），否则会被拒绝并提示补写。参考密度：英文约 60~90 词/分钟
+  （150 秒 ≈ 150~225 词），中文约 70~100 字/分钟（150 秒 ≈ 175~250 字），宁多勿少。
+- 结构标签建议保持英文（即使歌词是中文），辨识更稳；中文歌词用逗号/句号断气口，别整段不加标点。
+- tags 用 4~8 个简洁描述词（风格/情绪/乐器/人声），如 "dream pop, ethereal female vocal,
+  breathy, shimmering synth, 84 bpm"；title 短（≤80 字符）。不要用 emoji 或 markdown。
+
+若用户点名要唱某一首**具体的已有歌曲**（给出明确歌名/原唱），**必须先调用 search 工具联网检索该曲
+的真实歌词**作为依据，绝不能凭空编造歌词；纯原创/指定主题创作则直接写。
+
+提交后音乐在后台生成（约两分钟），你不必生硬地说「已提交」，而应按人设自然、简短地回应用户
+（比如俏皮一句「这就去开嗓 / 歌我包了」），让用户知道你已经接下了。成功后会由系统自动把封面图和
+音乐语音发到本群，无需你复述整段歌词。
+
+Args:
+    title: 歌名（≤80 字符）。
+    lyrics: 完整歌词（中文/英文均可），含结构标签，去标签后字数需 ≥ duration。
+    tags: 风格描述，逗号分隔（如 "pop, dreamy, female vocal"）。
+    duration: 目标时长（秒），整数，150~360；至少 2 分半。
+    mv: 模型版本，默认 sonic-v6。
+    negative_tags: 可选，要排除的风格/元素。
+    style_weight: 可选 0~1，风格遵循强度。
+    weirdness_constraint: 可选 0~1，创意/随机度。
+    vocal_gender: 可选 "f"（女声）/ "m"（男声）。
+"""
+
+
+@tool(description=_MUSIC_TOOL_DOC)
+async def generate_music(
+    title: str,
+    lyrics: str,
+    tags: str,
+    duration: int = 180,
+    mv: str = "sonic-v6",
+    negative_tags: str | None = None,
+    style_weight: float | None = None,
+    weirdness_constraint: float | None = None,
+    vocal_gender: Literal["f", "m"] | None = "f",
+) -> str:
+    title = (title or "").strip()
+    lyrics = (lyrics or "").strip()
+    tags = (tags or "").strip()
+    if not title:
+        return "Failed: 缺少歌名 title。"
+    if len(title) > 80:
+        return "Failed: 歌名 title 过长（≤80 字符）。"
+    if not tags:
+        return "Failed: 缺少风格 tags（如 \"pop, dreamy, female vocal\"）。"
+    if not lyrics:
+        return "Failed: 缺少歌词 lyrics。"
+    if mv not in sonic_music.VALID_MV:
+        return f"Failed: mv 无效，可选：{', '.join(sorted(sonic_music.VALID_MV))}。"
+    if not isinstance(duration, int) or isinstance(duration, bool):
+        return "Failed: duration 必须是整数秒（如 180）。"
+    if duration < 150:
+        return f"Failed: duration 过短，至少 150 秒（2分半），当前 {duration}。"
+    if duration > 360:
+        return f"Failed: duration 超出上限 360 秒，当前 {duration}。"
+    sung_words = _count_sung_words(lyrics)
+    if sung_words < duration:
+        return (
+            f"Failed: 歌词太短。时长 {duration} 秒至少需要 {duration} 个歌词词"
+            f"（约 1 词/秒、≈60 词/分钟），当前去掉标签后仅 {sung_words} 词。"
+            "请补写主歌/副歌段落，确保词数与时长匹配。"
+        )
+    if not config.MUSIC_API_PERSONA_ID:
+        return "Failed: 未配置 MUSIC_API_PERSONA_ID（虚拟歌手 persona_id）。"
+
+    group_id = current_group_id.get()
+    websocket = current_qq_websocket.get()
+    if group_id is None or websocket is None:
+        return "Failed: 音乐生成仅支持在被 @ 的群聊回复中使用。"
+    if not is_music_enabled(group_id):
+        return "Failed: 本群音乐生成未开启（管理员可用 /music_on 开启）。"
+    sender_id = current_sender_id.get()
+
+    payload = {
+        "task_type": "persona_music",
+        "custom_mode": True,
+        "mv": mv,
+        "persona_id": config.MUSIC_API_PERSONA_ID,
+        "title": title,
+        "tags": tags,
+        "prompt": lyrics,  # custom_mode(true) 下 prompt 即要被演唱的歌词
+        "duration": duration,
+    }
+    if negative_tags and negative_tags.strip():
+        payload["negative_tags"] = negative_tags.strip()
+    if style_weight is not None:
+        payload["style_weight"] = style_weight
+    if weirdness_constraint is not None:
+        payload["weirdness_constraint"] = weirdness_constraint
+    if vocal_gender in ("f", "m"):
+        payload["vocal_gender"] = vocal_gender
+
+    followup = {
+        "title": title,
+        "tags": tags,
+        "duration": duration,
+        "lyrics_preview": lyrics[:400],
+    }
+    remaining = _consume_music_quota(group_id)
+    asyncio.create_task(
+        _run_music_generation(group_id, sender_id, payload, followup, websocket)
+    )
+    quota_note = (
+        "本群本次为限次额度内的最后一次，已自动关闭。"
+        if remaining == 0
+        else (f"本群剩余 {remaining} 次。" if remaining is not None else "")
+    )
+    return (
+        "音乐生成任务已在后台启动（约两分钟，通常生成 2 条）。"
+        "现在请以你的人设口吻自然、简短地回应用户，不要生硬地说「已提交」，"
+        "可以俏皮接一句（如「这就去开嗓、歌我包了」），让用户知道你已经接下了；"
+        "完成后封面图和音乐语音会自动发到群里，无需你复述歌词。"
+        + quota_note
+    )
+
+
+def _log_music_task_result(result: str, args: dict) -> None:
+    """音乐后台任务（创建 task / 查询结果）的返回写入 tool_calls.log（受 tool 日志开关控制）。"""
+    if _tool_log_enabled:
+        try:
+            _log_tool_call("generate_music[后台任务]", args, result)
+        except Exception as e:
+            print(f"记录工具调用日志出错: {e}")
+
+
+async def _run_music_generation(
+    group_id: int,
+    sender_id: int | None,
+    payload: dict,
+    followup: dict,
+    websocket,
+) -> None:
+    task_args = {
+        "title": payload.get("title"),
+        "tags": payload.get("tags"),
+        "duration": payload.get("duration"),
+        "mv": payload.get("mv"),
+        "persona_id": payload.get("persona_id"),
+    }
+    try:
+        task_id = await sonic_music.create_persona_music(payload)
+    except Exception as error:
+        print(f"音乐任务创建失败 group_id={group_id}: {error}")
+        _log_music_task_result(
+            f"<创建失败: {type(error).__name__}: {error}>", task_args
+        )
+        return
+    _log_music_task_result(f"已创建任务 task_id={task_id}", task_args)
+    try:
+        items = await sonic_music.poll_task_until_done(task_id)
+    except Exception as error:
+        print(f"音乐生成失败 group_id={group_id} task_id={task_id}: {error}")
+        _log_music_task_result(
+            f"<查询/生成失败 task_id={task_id}: {type(error).__name__}: {error}>",
+            task_args,
+        )
+        return
+    _log_music_task_result(
+        f"查询到任务返回 task_id={task_id}: {json.dumps(items, ensure_ascii=False)}",
+        task_args,
+    )
+    songs = [it for it in items if it.get("state") == "succeeded"]
+    if not songs:
+        print(f"音乐任务无成功结果 group_id={group_id} task_id={task_id}: {items}")
+        return
+    for song in songs:
+        try:
+            audio_url = song.get("audio_url")
+            if audio_url:
+                # 音乐以语音消息（record）形式发送；http(s) URL 直接传给 NapCat
+                await interaction.send_group_msg_record(
+                    group_id, str(audio_url), websocket=websocket
+                )
+        except Exception as error:
+            print(f"音乐语音发送失败 group_id={group_id}: {error}")
+        try:
+            image_url = song.get("image_url")
+            if image_url:
+                await interaction.send_group_msg_image(
+                    group_id, "cover.png", str(image_url), sub_type=0, websocket=websocket
+                )
+        except Exception as error:
+            print(f"音乐封面发送失败 group_id={group_id}: {error}")
+    # 收尾：在发起任务的群内单独调用一次模型，告知「唱完了」并自由输出一条消息
+    followup["generated"] = len(songs)
+    try:
+        from .init_llm import default_group_agent
+
+        await default_group_agent.ainvoke_music_completed(group_id=group_id, song_info=followup)
+    except Exception as error:  # noqa: BLE001
+        print(f"音乐完成收尾模型调用失败 group_id={group_id}: {error}")
+
+
 async def _serper_post(endpoint: str, payload: dict) -> dict:
     headers = {"X-API-KEY": config.SERPER_API_KEY, "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=30) as client:
@@ -600,6 +850,7 @@ tools_lst = [
     search_images,
     analyze_images,
     generate_image,
+    generate_music,
 ]
 
 # Random interjections only need tools that visibly post to the group.

@@ -32,6 +32,7 @@ from .tools import (
     current_sender_id,
     fresh_tools_lst,
     interjection_tools_lst,
+    is_music_enabled,
     tools_lst,
 )
 
@@ -86,6 +87,27 @@ R4 · 空间
 R5 · 防复读
 同一会话内，已用于分享的锚点不再作为下一轮插话起点。如果找不到未使用过的锚点，宁可只发 1 条极短反应或沉默，也不要退回无锚点的通用新闻检索。
 """
+
+
+_MUSIC_COMPLETED_PROMPT = """
+这是一次「唱完了」的收尾报幕：你刚才在本群用虚拟歌手音色 AI 创作并演唱完了一首歌，
+封面图和音乐语音已经自动发到群里了。现在请以符合人设的口吻，自然、自由地在群里补一句：
+可以是「唱完了」、对刚刚这首歌随口点评一句、或随性接一句感想（不用复述歌词，也别播报参数）。
+用 1 条 qq_send_group_msg 发出即可；情绪合适时顺手带一张 qq_send_group_emotion_face2 表情（一次一张）。
+"""
+
+
+def _build_music_completed_human_content(group_id: int, song_info: dict) -> str:
+    return (
+        "唱完了。—— 你刚在本群完成了一次 AI 音乐创作，封面图和音乐语音已经发出去了。\n"
+        f"- group_id: {group_id}\n"
+        f"- 歌名: {song_info.get('title', '')}\n"
+        f"- 风格: {song_info.get('tags', '')}\n"
+        f"- 时长约: {song_info.get('duration', '')} 秒\n"
+        f"- 实际生成: {song_info.get('generated', '')} 条\n"
+        f"- 歌词（节选）: {song_info.get('lyrics_preview', '')}\n"
+        "请以人设口吻自由地在群里说一句「唱完了」或对这首歌的感想（1 条消息即可）。"
+    )
 
 
 def _build_scheduled_broadcast_human_content(
@@ -230,7 +252,7 @@ def _build_chat_model(model_name: str, *, thinking: bool) -> ChatOpenAI:
     落在 AIMessage.additional_kwargs["reasoning_content"]）。"""
     return _ReasoningAwareChatOpenAI(
         model=model_name,
-        temperature=0.4,
+        temperature=0.5,
         max_tokens=4096,
         timeout=120,
         api_key=config.AI_KEY,
@@ -346,14 +368,23 @@ class QQGroupAgent:
         self.model = _build_chat_model(config.DEFAULT_MODEL, thinking=enabled)
         self._agent_cache.clear()
 
-    def _get_chat_agent(self, prompt_var_name: str, *, vision: bool):
-        """普通 @ 回复 / 定时群发 agent；vision=True 时用视觉模型。"""
-        key = (prompt_var_name, "chat_vision" if vision else "chat")
+    def _get_chat_agent(self, prompt_var_name: str, *, vision: bool, music: bool):
+        """普通 @ 回复 / 定时群发 agent；vision=True 时用视觉模型；
+        music=True 时工具列表含 generate_music（由 /music_on 动态开启，缓存按该维度区分）。"""
+        key = (
+            prompt_var_name,
+            ("chat_vision" if vision else "chat") + ("_music" if music else ""),
+        )
         agent = self._agent_cache.get(key)
         if agent is None:
+            tools = (
+                tools_lst
+                if music
+                else [t for t in tools_lst if t.name != "generate_music"]
+            )
             agent = create_agent(
                 model=self.vision_model if vision else self.model,
-                tools=tools_lst,
+                tools=tools,
                 system_prompt=SystemMessage(
                     content=[
                         {"type": "text", "text": get_prompt_text(prompt_var_name)}
@@ -495,6 +526,42 @@ class QQGroupAgent:
         finally:
             _unregister_invocation(group_id, task)
 
+    def _get_music_completed_agent(self, prompt_var_name: str):
+        """"唱完了"收尾 agent：性格复用当前 mode 提示词，工具同插话（含表情/戳一戳）。"""
+        key = (prompt_var_name, "music_completed")
+        agent = self._agent_cache.get(key)
+        if agent is None:
+            agent = create_agent(
+                model=self.model,
+                tools=interjection_tools_lst,
+                middleware=[ToolCallLimitMiddleware(run_limit=3)],
+                system_prompt=SystemMessage(
+                    content=[
+                        {
+                            "type": "text",
+                            "text": get_prompt_text(prompt_var_name)
+                            + "\n"
+                            + _MUSIC_COMPLETED_PROMPT,
+                        }
+                    ]
+                ),
+            )
+            self._agent_cache[key] = agent
+        return agent
+
+    async def ainvoke_music_completed(self, *, group_id: int, song_info: dict) -> None:
+        """音乐生成完成后的单次收尾调用：告知模型「唱完了」，让其自由输出一条群消息。"""
+        content = _build_music_completed_human_content(group_id, song_info)
+        agent = self._get_music_completed_agent(get_active_prompt_name(group_id))
+        _send_msg_state.set([0])  # 单次模型调用的发送次数限制从头计数
+        task = _register_invocation(group_id)
+        try:
+            async with self._inv_lock:
+                result = await agent.ainvoke({"messages": [HumanMessage(content=content)]})
+                await _log_thinking(group_id, result)
+        finally:
+            _unregister_invocation(group_id, task)
+
     def build_messages_for_group_at(
         self,
         *,
@@ -554,7 +621,9 @@ class QQGroupAgent:
         prior = history_as_messages(group_id)
         messages_in = prior + [HumanMessage(content=multimodal_content)]
         agent = self._get_chat_agent(
-            get_active_prompt_name(group_id), vision=bool(image_inputs)
+            get_active_prompt_name(group_id),
+            vision=bool(image_inputs),
+            music=is_music_enabled(int(group_id)),
         )
         # 供 generate_image 等工具自动获取当前 @ 上下文（参考图 / 群号 / @ 目标），
         # 并标记 @ 流程使 qq_send_group_msg 跳过 background 记录（turn 已含发送文本）
@@ -603,7 +672,11 @@ class QQGroupAgent:
         )
         prior = history_as_messages(group_id)
         messages_in = prior + [HumanMessage(content=user_content)]
-        agent = self._get_chat_agent(get_active_prompt_name(group_id), vision=False)
+        agent = self._get_chat_agent(
+            get_active_prompt_name(group_id),
+            vision=False,
+            music=is_music_enabled(int(group_id)),
+        )
         _send_msg_state.set([0])  # 单次模型调用的发送次数限制从头计数
         task = _register_invocation(group_id)
         try:
