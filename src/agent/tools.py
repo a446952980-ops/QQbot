@@ -599,7 +599,7 @@ tools_lst = [
     scrape_website,
     search_images,
     analyze_images,
-    # generate_image,
+    generate_image,
 ]
 
 # Random interjections only need tools that visibly post to the group.
