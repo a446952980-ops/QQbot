@@ -177,15 +177,13 @@ async def qq_send_group_emotion_face(group_id: int, face: str) -> str:
 
 @tool
 async def qq_send_group_emotion_face2(group_id: int) -> str:
-    """发一个随机自定义 QQ 表情给群（图片形式，不占文字）。
+    """Send one randomly picked custom QQ face (sticker) to the group.
 
-    这是“活人感”的可见节拍，不是要等情绪特别强烈才用的稀有道具：
-    - 无语、惊讶、开心、得意、嫌弃、心动、被冒犯、想吐槽时，都可以顺手发一个；
-    - 接梗、反撩、吐槽、夸人、认怂之后，可以配一个表情一起发；
-    - 一回合一个就够，别连续刷，也别用表情代替要说的正文。
-
-    常见用法：先发这个表情，再补一句短正文（或配合 qq_send_group_msg 带文字）。
-    """
+    这是低成本、高性价比的互动动作：只要此刻有情绪波动——开心、无语、嫌弃、
+    尴尬、被逗笑、想吐槽、捧哏——就顺手发一张，不必等到“情绪强烈”。
+    可以搭着文字一起用（先表情后文字或反过来都行），一次最多一张，
+    别刷屏，也别用它代替文字本身。它是“我在、我看见了”的自然反应，
+    不是需要克制的东西。"""
     try:
         faces = await interaction.fetch_custom_faces(count=48)
         if not faces:
@@ -203,14 +201,14 @@ async def qq_send_group_emotion_face2(group_id: int) -> str:
 @tool
 async def qq_group_poke(group_id: int, user_id: int) -> str:
     """
-    戳一戳群里的某个人（轻量动手，不用说话）。
-    这是聊天手感的一部分，不是稀有动作：
-    - 玩笑落地后、接完梗、吐槽完、有人 @ 你之后、想表示“我在/我看到了”时，顺手戳一下；
-    - 只戳和当前对话有关的那个群友（sender_id 或 @ 的目标），别乱戳无关的人。
+    戳一戳某位群成员——一种无言的、轻量的“我在”互动，不是需要慎重的招呼。
+    接完梗、回完 @、想逗对方一下、想确认“我看见了”，或插话时想轻轻引起
+    注意，都可以顺手戳一下当互动；先戳或先说话都行，但别只戳不说话、
+    别把它当开场白滥用。
 
     Args:
         group_id: 目标群号。
-        user_id: 要戳的群成员 QQ 号（纯数字）。
+        user_id: 要戳的群成员 QQ 号（纯数字，从上下文取当前发送者或你回应的人）。
     """
     try:
         await interaction.group_poke(group_id, user_id)
@@ -276,7 +274,7 @@ async def analyze_images(urls: list[str], prompt: str | None = None) -> str:
 async def search(
     query: str,
     topic: Literal["general", "news", "finance"] = None,
-    time_range: Literal["day", "week", "month", "year"] = "week",
+    time_range: Literal["day", "week", "month", "year"] = "day",
     include_domains: Sequence[str] = None,
     exclude_domains: Sequence[str] = None,
 ) -> dict:
@@ -286,13 +284,16 @@ async def search(
     web sources. Prefer `crawl_website` when deep multi-page exploration is needed;
     use `search_images` when looking for pictures instead of text.
 
-    默认只搜最近一周（time_range="week"）。如果一周内搜不到、结果太少或与问题无关，
-    再逐步扩大范围重搜："month"、"year"；不要一上来就用大范围。
+    涉及时效性的查询（新闻、价格、版本、比分、某人近况、最新动态等）必须：
+    1. 先看每条结果的发布时间/日期，与当前日期比对，判断是否满足时效要求；
+    2. 默认 time_range="day" 搜最近 1 天；若结果过少或没有满足要求的，就增大到
+       "week" 再搜；仍不够再 "month"，最后 "year"，逐级扩大直到找到为止；
+    3. 结果里若没有日期信息，视为不可靠，继续向上扩大 time_range 重搜。
 
     Args:
         query: Search query, e.g. "latest AI research papers 2025".
         topic: "news" for current events; "general" for broad searches; "finance" for markets.
-        time_range: 默认 "week"（最近一周）。搜不到时再扩大到 "month" 或 "year"；确需更近可用 "day"。
+        time_range: Filter by recency: "day", "week", "month", or "year".(default: "day")
         include_domains: Optional allowlist of domains (max 300).
         exclude_domains: Optional blocklist of domains (max 150).
     """
@@ -393,12 +394,14 @@ def _qzone_quota_consume() -> None:
 async def qq_send_qzone_msg(content: str, images: list[str] | None = None) -> str:
     """
     发表一条 QQ 空间说说（当天最多 3 条，超出会被拒绝）。
-    空间是你的朋友圈，不是群聊复述板：只在你自己产生真实反应时发——
-    一个离谱梗、一句想记住的吐槽、一张好笑的图、一段聊出共鸣的话。
-    判断标准是「我自己想发」，不是「够不够格」；想发就发，别硬憋，
-    但也别为了凑数硬发，两次之间间隔一下，别连续刷屏。
-    content 用自己的口吻写，1-3 句话；images可以
-    传 0-3 张图片 URL（来自 search_images / 群聊上下文）。
+
+    群聊里碰到让你自己产生情绪反应的瞬间——一个离谱梗、一句想记住的吐槽、
+    一张好笑的图、一段聊出共鸣的话——就把它加工成一条说说发出去。
+    判断标准是“我自己想留档”，不是“这条够不够格”；值得记就发，
+    一天最多 3 条，两次之间自然隔开，别把群里的原话直接照搬。
+
+    content 用自己的口吻写（符合当前人设），1-3 句话；images 可选，
+    传 0-3 张图片 URL（来自 search_images / 群聊上下文），纯文字则留空。
     发表成功返回 OK，失败返回 Failed 原因。
 
     Args:

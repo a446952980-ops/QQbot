@@ -46,6 +46,11 @@ VISION_MODEL = os.getenv("VISION_MODEL")
 AI_KEY = os.getenv("AI_KEY")
 AI_BASE_URL = os.getenv("AI_BASE_URL")
 
+# ---- 对话压缩专用模型：独立 base_url 与 model，api key 缺省回退 AI_KEY ----
+COMPRESSION_MODEL = os.getenv("COMPRESSION_MODEL") or DEFAULT_MODEL
+COMPRESSION_BASE_URL = os.getenv("COMPRESSION_BASE_URL") or AI_BASE_URL
+COMPRESSION_API_KEY = (os.getenv("COMPRESSION_API_KEY") or AI_KEY or "").strip()
+
 DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
 DASHSCOPE_API_MODEL = os.getenv("DASHSCOPE_API_MODEL")
 
@@ -82,6 +87,12 @@ PROACTIVE_GROUP_IDS: list[int] = _parse_int_list((os.getenv("PROACTIVE_GROUP_IDS
 
 # 管理员 QQ 账号（逗号或分号分隔），可执行 /shutdown、/startup 等管理员指令
 ADMIN_QQ_IDS: list[int] = _parse_int_list((os.getenv("ADMIN_QQ_IDS") or "").strip())
+
+# 群聊黑名单（逗号或分号分隔的群号），进入黑名单的群任何消息都不处理
+GROUP_BLACKLIST: set[int] = set(_parse_int_list((os.getenv("GROUP_BLACKLIST") or "").strip()))
+
+# 账号黑名单（逗号或分号分隔的 QQ 号），这些账号不会触发 @ 回复与随机插话
+ACCOUNT_BLACKLIST: set[int] = set(_parse_int_list((os.getenv("ACCOUNT_BLACKLIST") or "").strip()))
 
 
 def _parse_ws_cmd_tcp_bind(s: str) -> tuple[str, int] | None:

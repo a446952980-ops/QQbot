@@ -6,6 +6,7 @@ import json
 import re
 import threading
 from collections import defaultdict, deque
+from datetime import datetime
 from pathlib import Path
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
@@ -28,6 +29,10 @@ _turn_store: dict[int, deque[tuple[int, str, str]]] = defaultdict(
 _background_store: dict[int, deque[tuple[int, str]]] = defaultdict(
     lambda: deque(maxlen=MAX_BACKGROUND_MESSAGES)
 )
+# 已压缩的历史摘要（每群一条，代表该群更早的对话记忆）
+_summary_store: dict[int, str] = {}
+# 正在后台压缩中的群，避免重复触发
+_compressing: set[int] = set()
 
 
 def _persist_paths() -> tuple[Path, Path]:
@@ -48,6 +53,7 @@ def _load_persisted() -> None:
         return
     loaded_turns: dict[int, deque[tuple[int, str, str]]] = {}
     loaded_background: dict[int, deque[tuple[int, str]]] = {}
+    loaded_summary: dict[int, str] = {}
     for key, value in raw.items():
         try:
             gid = int(key)
@@ -55,6 +61,7 @@ def _load_persisted() -> None:
             continue
         raw_turns = value.get("turns", []) if isinstance(value, dict) else value
         raw_background = value.get("background", []) if isinstance(value, dict) else []
+        raw_summary = value.get("summary", "") if isinstance(value, dict) else ""
         if not isinstance(raw_turns, list):
             continue
         turns: list[tuple[int, str, str]] = []
@@ -80,22 +87,30 @@ def _load_persisted() -> None:
                 loaded_background[gid] = deque(
                     background[-MAX_BACKGROUND_MESSAGES:], maxlen=MAX_BACKGROUND_MESSAGES
                 )
+        if isinstance(raw_summary, str) and raw_summary.strip():
+            loaded_summary[gid] = raw_summary.strip()
     _turn_store.update(loaded_turns)
     _background_store.update(loaded_background)
+    _summary_store.update(loaded_summary)
 
 
 def _save_persisted() -> None:
     data_dir, path = _persist_paths()
     data_dir.mkdir(parents=True, exist_ok=True)
-    payload: dict[str, dict[str, list[list[object]]]] = {}
-    for gid in set(_turn_store) | set(_background_store):
+    payload: dict[str, dict] = {}
+    for gid in set(_turn_store) | set(_background_store) | set(_summary_store):
         turns = _turn_store.get(gid)
         background = _background_store.get(gid)
-        if turns or background:
-            payload[str(gid)] = {
-                "turns": [[timestamp, user, assistant] for timestamp, user, assistant in turns or ()],
-                "background": [[timestamp, content] for timestamp, content in background or ()],
-            }
+        summary = _summary_store.get(gid)
+        if not (turns or background or summary):
+            continue
+        entry: dict = {
+            "turns": [[timestamp, user, assistant] for timestamp, user, assistant in turns or ()],
+            "background": [[timestamp, content] for timestamp, content in background or ()],
+        }
+        if summary:
+            entry["summary"] = summary
+        payload[str(gid)] = entry
     text = json.dumps(payload, ensure_ascii=False, indent=2)
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(text, encoding="utf-8")
@@ -110,7 +125,8 @@ def history_as_messages(group_id: int) -> list[HumanMessage | AIMessage]:
     with _lock:
         turns = _turn_store.get(group_id)
         background = _background_store.get(group_id)
-        if not turns and not background:
+        summary = _summary_store.get(group_id)
+        if not turns and not background and not summary:
             return []
         events: list[tuple[int, int, BaseMessage]] = []
         for timestamp, content in background or ():
@@ -120,7 +136,10 @@ def history_as_messages(group_id: int) -> list[HumanMessage | AIMessage]:
             events.append(
                 (timestamp, 2, AIMessage(content=_clean_cached_assistant_content(assistant_content)))
             )
-        return [message for _, _, message in sorted(events, key=lambda item: item[:2])]
+        messages = [message for _, _, message in sorted(events, key=lambda item: item[:2])]
+        if summary:
+            messages = [HumanMessage(content=f"【更早的群聊记忆摘要】\n{summary}")] + messages
+        return messages
 
 
 def _clean_cached_assistant_content(content: str) -> str:
@@ -314,3 +333,86 @@ def build_assistant_combined_for_cache(messages: list[BaseMessage]) -> str:
     if final:
         parts.append(final)
     return "\n\n".join(parts) if parts else "(no assistant output)"
+
+
+# ---- 对话压缩（后台 summarize 旧轮次，释放上下文，同时保留长期记忆） ----
+
+def get_summary(group_id: int) -> str | None:
+    with _lock:
+        return _summary_store.get(group_id)
+
+
+def _render_transcript(
+    background: list[tuple[int, str]],
+    turns: list[tuple[int, str, str]],
+) -> str:
+    """把 background 与 @ turns 按事件时间合并排序，渲染成可读的时序文本，供压缩模型使用。"""
+    events: list[tuple[int, int, str]] = []
+    for ts, content in background:
+        events.append((ts, 0, f"[群聊（未@我）] {content}"))
+    for ts, user, assistant in turns:
+        events.append((ts, 1, f"[@我的消息] {user}"))
+        events.append((ts, 2, f"[我的回复] {_clean_cached_assistant_content(assistant)}"))
+    events.sort(key=lambda item: (item[0], item[1]))
+    lines: list[str] = []
+    for idx, (ts, _, text) in enumerate(events, 1):
+        try:
+            stamp = datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
+        except (ValueError, OSError, OverflowError):
+            stamp = str(ts)
+        lines.append(f"[{idx} · {stamp}] {text}")
+    return "\n\n".join(lines)
+
+
+def try_begin_compression(group_id: int, *, force: bool = False) -> dict | None:
+    """当某群 @ 轮次达到上限（或 force=True）且当前不在压缩中时，原子地标记压缩中并返回
+    一份时间一致的快照（含原始 turns/background 引用与渲染好的转录文本）。"""
+    with _lock:
+        if group_id in _compressing:
+            return None
+        turns = list(_turn_store.get(group_id) or ())
+        background = list(_background_store.get(group_id) or ())
+        prev_summary = _summary_store.get(group_id)
+        if not (turns or background or prev_summary):
+            return None
+        if not force and len(turns) < MAX_TURNS:
+            return None
+        _compressing.add(group_id)
+    return {
+        "turns": turns,
+        "background": background,
+        "summary": prev_summary,
+        "transcript": _render_transcript(background, turns),
+    }
+
+
+def finish_compression(group_id: int, summary: str, snapshot: dict) -> None:
+    """压缩完成后回写：把新摘要存入 summary_store，并仅清除快照里已有的 turns/background
+    （压缩期间新增的条目按对象身份保留），最后落盘。"""
+    with _lock:
+        _compressing.discard(group_id)
+        if summary:
+            _summary_store[group_id] = summary
+        current_turns = _turn_store.get(group_id)
+        if current_turns is not None:
+            old_ids = {id(t) for t in snapshot.get("turns") or ()}
+            _turn_store[group_id] = deque(
+                (t for t in current_turns if id(t) not in old_ids), maxlen=MAX_TURNS
+            )
+        current_bg = _background_store.get(group_id)
+        if current_bg is not None:
+            old_ids = {id(b) for b in snapshot.get("background") or ()}
+            _background_store[group_id] = deque(
+                (b for b in current_bg if id(b) not in old_ids),
+                maxlen=MAX_BACKGROUND_MESSAGES,
+            )
+        try:
+            _save_persisted()
+        except OSError:
+            pass
+
+
+def abort_compression(group_id: int) -> None:
+    """压缩失败时解除标记，保留原上下文，等待下次达到上限再重试。"""
+    with _lock:
+        _compressing.discard(group_id)

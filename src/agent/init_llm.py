@@ -14,10 +14,13 @@ from langchain_openai import ChatOpenAI
 from langchain.messages import SystemMessage
 
 from .conversation_history import (
+    abort_compression,
     append_turn,
     build_assistant_combined_for_cache,
     extract_final_assistant_text,
+    finish_compression,
     history_as_messages,
+    try_begin_compression,
 )
 from .group_prompt import get_active_prompt_name, get_prompt_text
 from .tools import (
@@ -33,18 +36,18 @@ from .tools import (
 )
 
 _RANDOM_INTERJECTION_PROMPT = """
-现在没有任何人专门对你说话，只是群友们在自己闲聊。这是一次心跳插话：你醒了一下，看一眼群聊，然后决定要不要说点什么。
+现在没有任何人专门对你说话，只是群友们在自己闲聊。这是一次心跳插话：你醒了一下，看一眼群聊，然后决定要不要说点什么、怎么表达。
 
-你可以沉默。如果此刻没有你想接的话、没有让你产生反应的瞬间、没有你真正好奇的东西，直接结束本轮，不调用任何发送工具。沉默不扣分，硬凑一条才扣分。你的最终文本不会被发送，也不会进入上下文。
+先看有没有让你真正有反应的锚点：一句想吐槽的话、一个想接的梗、一个想顺着玩的黑话、一张想点开看的图、一个刚 @ 过你或你正想回应的群友。有反应就表达，别憋着；真的一点反应都没有，才沉默（这是允许的，硬凑比不发更差）。你的最终文本不会被发送，也不会进入上下文，只有工具调用才真正往外丢东西。
 
-如果想说话，从上下文里抓一个你真正有反应的锚点：一句让你想吐槽的话、一个你好奇出处的梗、一张你想点开看的图、一个让你想顺着玩下去的黑话。锚点不必是“新鲜事”，不必有信息增量，可以只是一个你想接的茬。
+表达不一定只有文字。除了发消息，多伸手用这些“低成本互动”，挑最贴合当下情绪的那个动作做：
+- 情绪有波动（开心/无语/嫌弃/被逗笑/想吐槽/捧哏）→ 调 `qq_send_group_emotion_face2` 发一张表情，可搭文字，一次最多一张。
+- 想轻轻引起某位群友注意、接完梗想“戳”一下、回完 @ 想确认“我看见了”→ 调 `qq_group_poke`，user_id 取当前发送者或你回应的人。
+- 碰到一个想留档的瞬间（离谱梗/想记住的吐槽/好笑的图/聊出共鸣的话）→ 调 `qq_send_qzone_msg` 发条说说。
 
-活人感靠顺手动作，别省：
-- 情绪有变化（无语、惊讶、开心、嫌弃、得意、心动、被冒犯）就顺手 `qq_send_group_emotion_face2` 发一个表情，当作这句插话的节拍；
-- 接到值得回应的梗/玩笑后，可以 `qq_group_poke` 戳一下那个刚发言的群友（用 sender_id）；
-- 碰到自己真想留住的瞬间（一个离谱梗、一句想记住的吐槽），可以 `qq_send_qzone_msg` 发条说说，当天最多 3 条。
+一次插话不是“要么长篇要么沉默”：一条短句 + 一张表情、或一个恰到好处的戳，都是很自然的插话。默认至少用上其中一种非文字互动，实在找不到合适对象才只用文字。表情一次一张；戳和说说不是每条必发，挑最贴合的那个做即可。
 
-调用工具才是真正往群里丢东西；没有调用发送工具，本轮就是沉默，这是允许的。发送类工具合计最多 3 次（表情/戳一戳/文字/语音都算），别为了“完成插话”而硬发表情、硬戳人或凑字，动作要发自当前锚点。
+工具预算：合计最多约 3 次调用。没有值得说的才静默结束本轮，别为了凑数硬发。
 """
 
 _FRESH_INTERJECTION_PROMPT = """
@@ -76,7 +79,6 @@ R3 · 发送与表达（自然一点）
 3. 默认发 1 条，最多 2 条。第二条只在第一条已发出、主题不同、且仍有发送预算时发。禁止把同一主题拆成多条连续播报。
 4. 禁止元话语开头。第一句直接回指锚点或内容本身。不做参数清单式播报。
 5. 黄腔、擦边梗出现在上下文里时，可以接、可以反撩、可以懒散地挡，不突然念合规声明。
-6. 顺手动作：说完或分享时情绪有变化的，顺手 `qq_send_group_emotion_face2` 发个表情；接到梗想互动的，可以 `qq_group_poke` 戳一下相关群友。它们是活人感的一部分，不是额外任务，也别硬刷。
 
 R4 · 空间
 如果在闲逛或插话过程中自己产生了一个想留档的瞬间——一个离谱发现、一句你想记住的吐槽、一张好玩的图——可以调用 qq_send_qzone_msg。判断标准是“我自己想发”，不是“够不够格”。每日 3 条上限不变。
@@ -228,12 +230,42 @@ def _build_chat_model(model_name: str, *, thinking: bool) -> ChatOpenAI:
     落在 AIMessage.additional_kwargs["reasoning_content"]）。"""
     return _ReasoningAwareChatOpenAI(
         model=model_name,
-        temperature=0.1,
+        temperature=0.4,
         max_tokens=4096,
         timeout=120,
         api_key=config.AI_KEY,
         base_url=config.AI_BASE_URL,
         extra_body={"thinking": {"type": "enabled" if thinking else "disabled"}},
+    )
+
+
+_COMPRESSION_PROMPT = (
+    "你是群聊记忆压缩器。目标是把一段按时间排序的群聊记录压缩成一段简洁、信息密度高、"
+    "后续对话仅凭它就能接上语境的摘要。\n"
+    "要求：\n"
+    "1. 只输出摘要正文本身，不要工具调用、不要解释、不要任何标题或前缀。\n"
+    "2. 保留并合并这些信息：关键事实（人名/昵称、数字、时间、约定、决定）、悬而未决的问题、"
+    "群成员之间的称呼/关系/偏好、与我（鲸鱼娘/大肥鱼）如何被称呼相关的重要信息、"
+    "进行中的梗或话题、需要后续跟进的事项。\n"
+    "3. 忽略机器元字段（current_time、group_id、sender_id、msg_id、Context for this "
+    "@-mention 等），只提炼真实对话内容。\n"
+    "4. 按事件先后组织，保持时间线；对过时、被推翻、无关紧要的闲聊可以丢弃，不要逐条复述。\n"
+    "5. 用要点式（每点以 - 开头）表达，控制在 300 字以内，方便只看摘要就能接上下文。\n"
+    "6. 若已提供「更早的摘要」，请在其基础上增量更新，避免重复堆砌；若新内容与旧摘要冲突，"
+    "以新内容为准。"
+)
+
+
+def _build_compression_model() -> ChatOpenAI:
+    """压缩专用模型：独立 base_url / model，调用方式与主模型一致。"""
+    return _ReasoningAwareChatOpenAI(
+        model=config.COMPRESSION_MODEL,
+        temperature=0.3,
+        max_tokens=1024,
+        timeout=120,
+        api_key=config.COMPRESSION_API_KEY,
+        base_url=config.COMPRESSION_BASE_URL,
+        extra_body={"thinking": {"type": "disabled"}},
     )
 
 
@@ -318,7 +350,7 @@ class QQGroupAgent:
             agent = create_agent(
                 model=self.vision_model if vision else self.model,
                 tools=interjection_tools_lst,
-                middleware=[ToolCallLimitMiddleware(run_limit=4)],
+                middleware=[ToolCallLimitMiddleware(run_limit=3)],
                 system_prompt=SystemMessage(
                     content=[
                         {
@@ -529,6 +561,7 @@ class QQGroupAgent:
             cached_user_content,
             assistant_combined,
         )
+        self._maybe_trigger_compression(group_id)
         return result
 
     async def ainvoke_scheduled_broadcast(
@@ -568,6 +601,49 @@ class QQGroupAgent:
             assistant_combined,
         )
         return result
+
+    def _maybe_trigger_compression(self, group_id: int) -> None:
+        """@ 轮次达到上限时，后台启动一次非阻塞的对话压缩（不 await、不占用 _inv_lock）。"""
+        snapshot = try_begin_compression(group_id)
+        if snapshot is None:
+            return
+        asyncio.create_task(self._compress_snapshot(group_id, snapshot))
+
+    async def _compress_snapshot(self, group_id: int, snapshot: dict) -> str | None:
+        """对给定快照执行一次压缩模型调用；成功回写并清除已压缩上下文、返回新摘要，失败回滚并返回 None。"""
+        try:
+            transcript = snapshot["transcript"]
+            previous = snapshot.get("summary")
+            body = transcript
+            if previous:
+                body = (
+                    f"已有的更早摘要：\n{previous}\n\n"
+                    f"--- 新增待压缩的群聊记录 ---\n\n{transcript}"
+                )
+            model = _build_compression_model()
+            resp = await model.ainvoke(
+                [
+                    SystemMessage(content=_COMPRESSION_PROMPT),
+                    HumanMessage(content=body),
+                ]
+            )
+            summary = (str(resp.content) or "").strip()
+            if not summary:
+                abort_compression(group_id)
+                return None
+            finish_compression(group_id, summary, snapshot)
+            return summary
+        except Exception as error:  # noqa: BLE001
+            abort_compression(group_id)
+            print(f"群 {group_id} 对话压缩失败: {error}")
+            return None
+
+    async def compress_group_now(self, group_id: int) -> str | None:
+        """/compress 主动压缩：忽略轮次阈值，立即压缩本群当前上下文（已在压缩中或无内容返回 None）。"""
+        snapshot = try_begin_compression(group_id, force=True)
+        if snapshot is None:
+            return None
+        return await self._compress_snapshot(group_id, snapshot)
 
 
 default_group_agent = QQGroupAgent()

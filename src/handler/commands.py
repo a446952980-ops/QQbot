@@ -61,6 +61,7 @@ class GroupCommand(str, Enum):
     EMPTY = "/empty"
     STOP = "/stop"
     THINKING = "/thinking"
+    COMPRESS = "/compress"
     SHUTDOWN = "/shutdown"
     STARTUP = "/startup"
 
@@ -184,6 +185,24 @@ async def _handle_stop(
     return True
 
 
+async def _handle_compress(
+    arg: str | None, *, group_id: int, websocket: ClientConnection
+) -> bool:
+    """/compress：主动触发一次对话压缩（立即压缩本群当前上下文，无参数）"""
+    if arg is not None:
+        return False  # 带参数不触发
+    summary = await default_group_agent.compress_group_now(int(group_id))
+    if summary is None:
+        await interaction.send_group_msg(
+            group_id, "没有可压缩的内容/正在压缩中", websocket=websocket
+        )
+    else:
+        await interaction.send_group_msg(
+            group_id, "已压缩本群上下文", websocket=websocket
+        )
+    return True
+
+
 async def _handle_shutdown(
     arg: str | None, *, group_id: int, websocket: ClientConnection
 ) -> bool:
@@ -239,6 +258,7 @@ _COMMAND_HANDLERS: dict[GroupCommand, Callable[..., Awaitable[bool]]] = {
     GroupCommand.EMPTY: _handle_empty,
     GroupCommand.STOP: _handle_stop,
     GroupCommand.THINKING: _handle_thinking,
+    GroupCommand.COMPRESS: _handle_compress,
     GroupCommand.SHUTDOWN: _handle_shutdown,
     GroupCommand.STARTUP: _handle_startup,
 }

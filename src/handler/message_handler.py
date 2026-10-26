@@ -149,12 +149,17 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
     # 群消息
     if event_data.get("message_type") == "group":
         group_id = event_data.get("group_id")
+        gid = int(group_id) if group_id is not None else 0
+        # 群聊黑名单：进入黑名单的群任何消息不处理（不记录、不回复、不插话）
+        if gid in config.GROUP_BLACKLIST:
+            return
         group_name = event_data.get("group_name")
         sender = event_data.get("sender")
         if not isinstance(sender, dict):
             sender = {}
         sender_name = sender.get("nickname")
         sender_id = sender.get("user_id")
+        sender_uid = int(sender_id) if sender_id is not None else 0
         msg_id = event_data.get("message_id")
         event_time = event_data.get("time")
         if not isinstance(event_time, int | float):
@@ -213,6 +218,7 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
             sender_id is not None
             and str(sender_id) != str(self_id)
             and is_interjection_enabled(gid)
+            and sender_uid not in config.ACCOUNT_BLACKLIST
             and random.random() < config.RANDOM_INTERJECTION_PROBABILITY
         ):
             # 触发插话后按概率分流：新鲜事分享事件 / 普通插话事件
@@ -249,7 +255,7 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
             append_background_message(
                 int(group_id) if group_id is not None else 0,
                 int(event_time),
-                "【群聊背景消息：不是对机器人的 @ 指令】\n"
+                "【群聊信息（没有@你）：】\n"
                 f"发送者: {display_name} (QQ: {sender_id or '未知'})\n"
                 f"内容: {_format_message_content(segments)}",
             )
@@ -262,6 +268,10 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
 
             # @到自己
             if is_at_self:
+                # 账号黑名单：不触发 @ 回复
+                if sender_uid in config.ACCOUNT_BLACKLIST:
+                    print(f"【{group_name}】[黑名单账号] [{sender_name}] @ {text}")
+                    return
                 # @ 回复已被 /shutdown -at 关闭：仅记背景与日志，不回复
                 if not is_at_reply_enabled(gid):
                     append_background_message(
