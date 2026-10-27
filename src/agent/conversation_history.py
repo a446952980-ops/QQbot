@@ -33,6 +33,29 @@ _background_store: dict[int, deque[tuple[int, str]]] = defaultdict(
 _summary_store: dict[int, str] = {}
 # 正在后台压缩中的群，避免重复触发
 _compressing: set[int] = set()
+# 每群已展开写入上下文（background / @ 轮次）的合并转发：id -> 渲染块文本。
+# 当前消息再次引用同一转发时，历史中的旧展开副本仅在本次模型调用渲染时
+# 临时替换为占位符（存储不动），避免同一段转发内容在上下文里重复出现。
+# dict 充当有序集合，超限丢最早记录。
+_forward_blocks: dict[int, dict[str, str]] = {}
+_FORWARD_SEEN_KEEP = 200
+_FORWARD_OMIT_PLACEHOLDER = "【这是你收到的最新一次消息引用的转发内容，已省略】"
+
+
+def mark_forward_blocks(group_id: int, blocks: dict[str, str]) -> None:
+    """登记已展开写入该群上下文的合并转发块（内存态，随上下文清空而清空）。"""
+    try:
+        gid = int(group_id)
+    except (TypeError, ValueError):
+        return
+    clean = {fid: text for fid, text in blocks.items() if fid and text}
+    if not clean:
+        return
+    known = _forward_blocks.setdefault(gid, {})
+    known.update(clean)
+    if len(known) > _FORWARD_SEEN_KEEP:
+        for fid in list(known)[: len(known) - _FORWARD_SEEN_KEEP // 2]:
+            known.pop(fid, None)
 
 
 def _persist_paths() -> tuple[Path, Path]:
@@ -120,14 +143,40 @@ def _save_persisted() -> None:
 _load_persisted()
 
 
-def history_as_messages(group_id: int) -> list[HumanMessage | AIMessage]:
-    """Replay @ turns and up to 10 non-@ group messages in event-time order."""
+def _substitute_forward_blocks(message: BaseMessage, blocks: list[str]) -> BaseMessage:
+    """把消息文本中已登记的转发展开块替换为占位符；未命中原样返回。"""
+    content = message.content
+    if not isinstance(content, str):
+        return message
+    text = content
+    for block in blocks:
+        if block in text:
+            text = text.replace(block, _FORWARD_OMIT_PLACEHOLDER)
+    if text == content:
+        return message
+    if isinstance(message, AIMessage):
+        return AIMessage(content=text)
+    return HumanMessage(content=text)
+
+
+def history_as_messages(
+    group_id: int, *, omit_forward_ids: frozenset[str] = frozenset()
+) -> list[HumanMessage | AIMessage]:
+    """Replay @ turns and up to 10 non-@ group messages in event-time order.
+
+    omit_forward_ids：当前消息新引用的转发 id。这些转发此前写入上下文的
+    展开副本在本次渲染中临时替换为占位符（当前消息内保留完整展开）。
+    """
     with _lock:
         turns = _turn_store.get(group_id)
         background = _background_store.get(group_id)
         summary = _summary_store.get(group_id)
         if not turns and not background and not summary:
             return []
+        omit_blocks: list[str] = []
+        if omit_forward_ids:
+            known = _forward_blocks.get(group_id, {})
+            omit_blocks = [known[fid] for fid in omit_forward_ids if fid in known]
         events: list[tuple[int, int, BaseMessage]] = []
         for timestamp, content in background or ():
             events.append((timestamp, 0, HumanMessage(content=content)))
@@ -137,6 +186,8 @@ def history_as_messages(group_id: int) -> list[HumanMessage | AIMessage]:
                 (timestamp, 2, AIMessage(content=_clean_cached_assistant_content(assistant_content)))
             )
         messages = [message for _, _, message in sorted(events, key=lambda item: item[:2])]
+        if omit_blocks:
+            messages = [_substitute_forward_blocks(msg, omit_blocks) for msg in messages]
         if summary:
             messages = [HumanMessage(content=f"【更早的群聊记忆摘要】\n{summary}")] + messages
         return messages
@@ -174,6 +225,7 @@ def append_turn(
 def clear_group_turns(group_id: int) -> None:
     """清空该群的 @ 轮次上下文，保留 background（供 mode 切换类指令使用）。"""
     with _lock:
+        _forward_blocks.pop(int(group_id), None)  # 转发内容可能原在轮次里，清掉防止占位符遮蔽
         turns = _turn_store.get(group_id)
         if turns:
             turns.clear()
@@ -186,6 +238,7 @@ def clear_group_turns(group_id: int) -> None:
 def clear_group_all(group_id: int) -> None:
     """清空该群全部上下文（turns + background）。"""
     with _lock:
+        _forward_blocks.pop(int(group_id), None)
         turns = _turn_store.get(group_id)
         background = _background_store.get(group_id)
         if not turns and not background:

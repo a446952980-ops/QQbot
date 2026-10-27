@@ -53,6 +53,31 @@ async def get_msg(message_id: int | str, websocket: ClientConnection | None = No
     return data if isinstance(data, dict) else None
 
 
+async def get_forward_msg(
+    forward_id: int | str, websocket: ClientConnection | None = None
+) -> list | None:
+    """通过 NapCat get_forward_msg API 获取合并转发消息的子消息列表（失败返回 None）。
+
+    同时传 message_id 与 id 以兼容不同 NapCat 版本的参数名。
+    """
+    ws = _resolve_ws(websocket)
+    try:
+        response = await request_napcat_api(
+            ws,
+            "get_forward_msg",
+            {"message_id": str(forward_id), "id": str(forward_id)},
+        )
+    except Exception as error:
+        print(f"查询合并转发消息失败 id={forward_id}: {error}")
+        return None
+    if not response or response.get("status") != "ok" or response.get("retcode") != 0:
+        print(f"查询合并转发消息失败 id={forward_id}: {response}")
+        return None
+    data = response.get("data")
+    messages = data.get("messages") if isinstance(data, dict) else data
+    return messages if isinstance(messages, list) else None
+
+
 async def fetch_custom_faces(
     count: int = 48, websocket: ClientConnection | None = None
 ) -> list[str]:

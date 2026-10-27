@@ -427,6 +427,7 @@ class QQGroupAgent:
         msg_id: int,
         text: str,
         image_inputs: list[tuple[str, str]] | None = None,
+        omit_forward_ids: frozenset[str] = frozenset(),
     ) -> None:
         """Run a tool-only random interjection; replay history for context
         (background + cached @ turns) but write nothing back."""
@@ -450,7 +451,9 @@ class QQGroupAgent:
                 result = await agent.ainvoke(
                     {
                         "messages": [
-                            *history_as_messages(group_id),
+                            *history_as_messages(
+                                group_id, omit_forward_ids=omit_forward_ids
+                            ),
                             HumanMessage(
                                 content=_build_multimodal_human_content(content, image_inputs)
                             ),
@@ -493,6 +496,7 @@ class QQGroupAgent:
         msg_id: int,
         text: str,
         image_inputs: list[tuple[str, str]] | None = None,
+        omit_forward_ids: frozenset[str] = frozenset(),
     ) -> None:
         """「新鲜事分享」插话事件：主动联网搜索并发享，工具总调用上限 5 次
         （analyze_images 不限）；性格复用当前 mode 提示词；不写回上下文。"""
@@ -515,7 +519,9 @@ class QQGroupAgent:
                 result = await agent.ainvoke(
                     {
                         "messages": [
-                            *history_as_messages(group_id),
+                            *history_as_messages(
+                                group_id, omit_forward_ids=omit_forward_ids
+                            ),
                             HumanMessage(
                                 content=_build_multimodal_human_content(content, image_inputs)
                             ),
@@ -596,6 +602,7 @@ class QQGroupAgent:
         text: str,
         event_time: int | None = None,
         image_inputs: list[tuple[str, str]] | None = None,
+        omit_forward_ids: frozenset[str] = frozenset(),
     ) -> dict:
         """
         Returns a dict with key `messages` (list of LangChain messages), same shape as
@@ -618,7 +625,7 @@ class QQGroupAgent:
             cached_user_content += "\n" + "\n".join(
                 f"{label}（图片内容未持久化）" for label, _ in image_inputs
             )
-        prior = history_as_messages(group_id)
+        prior = history_as_messages(group_id, omit_forward_ids=omit_forward_ids)
         messages_in = prior + [HumanMessage(content=multimodal_content)]
         agent = self._get_chat_agent(
             get_active_prompt_name(group_id),
