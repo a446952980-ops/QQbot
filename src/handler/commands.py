@@ -157,16 +157,29 @@ async def _handle_empty(
 async def _handle_thinking(
     arg: str | None, *, group_id: int, websocket: ClientConnection
 ) -> bool:
-    """/thinking：切换主模型思考模式（全局，默认关闭）；开启后思维链写入 data/thinking.log"""
-    if arg is not None:
-        return False  # 带了任何参数都不触发
-    enabled = not default_group_agent.is_thinking_enabled()
-    default_group_agent.set_thinking_enabled(enabled)
-    text = (
-        "thinking on"
-        if enabled
-        else "thinking off"
-    )
+    """/thinking：切换主模型思考模式（全局，默认关闭）；开启后思维链写入 data/thinking.log
+    并以合并转发消息发到群里。
+    /thinking -v：思考关闭时隐式开启思考，同时关闭思考过程的发送（只写日志）；
+    思考已开启时仅关闭思考过程发送，不动 thinking 模式本身。"""
+    if arg is not None and arg != "-v":
+        return False  # 仅支持无参数与 -v，其余传参不触发
+    if arg == "-v":
+        was_enabled = default_group_agent.is_thinking_enabled()
+        default_group_agent.set_thinking_enabled(True)
+        default_group_agent.set_thinking_forward_enabled(False)
+        text = (
+            "thinking on（silent）"
+            if not was_enabled
+            else "thinking on（silent）"
+        )
+    else:
+        enabled = not default_group_agent.is_thinking_enabled()
+        default_group_agent.set_thinking_enabled(enabled)
+        text = (
+            "thinking on"
+            if enabled
+            else "thinking off"
+        )
     await interaction.send_group_msg(group_id, text, websocket=websocket)
     return True
 
@@ -256,7 +269,8 @@ async def _handle_startup(
 async def _handle_music_on(
     arg: str | None, *, group_id: int, websocket: ClientConnection
 ) -> bool:
-    """/music_on [-N]：开启本群音乐生成工具；N 为正整数时限 N 次，达到后自动关闭；无参数不限次数"""
+    """/music_on [-N]：开启本群音乐生成工具；N 为正整数时限 N 次，额度用完后工具保持注册、
+    调用时直接返回已达上限；无参数不限次数"""
     if arg is None:
         quota: int | None = None
     elif arg.startswith("-") and arg[1:].isdigit() and int(arg[1:]) > 0:

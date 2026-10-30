@@ -42,9 +42,17 @@ TAVILY_KEY = os.getenv("TAVILY_KEY")
 SERPER_API_KEY = os.getenv("SERPER_API_KEY")
 
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL")
-VISION_MODEL = os.getenv("VISION_MODEL")
 AI_KEY = os.getenv("AI_KEY")
 AI_BASE_URL = os.getenv("AI_BASE_URL")
+
+# ---- 视觉 / 视频分析：各自独立 base_url、model、key，缺省回退 AI_KEY / AI_BASE_URL ----
+VISION_MODEL = os.getenv("VISION_MODEL")
+VISION_BASE_URL = os.getenv("VISION_BASE_URL") or AI_BASE_URL
+VISION_API_KEY = (os.getenv("VISION_API_KEY") or AI_KEY or "").strip()
+
+VIDEO_VISION_MODEL = os.getenv("VIDEO_VISION_MODEL")
+VIDEO_VISION_BASE_URL = os.getenv("VIDEO_VISION_BASE_URL") or AI_BASE_URL
+VIDEO_VISION_API_KEY = (os.getenv("VIDEO_VISION_API_KEY") or AI_KEY or "").strip()
 
 # ---- 对话压缩专用模型：独立 base_url 与 model，api key 缺省回退 AI_KEY ----
 COMPRESSION_MODEL = os.getenv("COMPRESSION_MODEL") or DEFAULT_MODEL

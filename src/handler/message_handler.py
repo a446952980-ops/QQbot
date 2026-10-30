@@ -158,7 +158,14 @@ async def _format_message_content(
             else:
                 parts.append(f"[图片{': ' + str(summary) if summary else ''}]")
         elif segment_type == "at":
-            parts.append(f"[@{data.get('qq', '未知用户')}]")
+            qq = data.get("qq")
+            nickname = data.get("nickname") or data.get("name") or ""
+            if qq == "all":
+                parts.append("[@全体成员]")
+            elif nickname and str(nickname) != str(qq):
+                parts.append(f"[@{nickname} (QQ:{qq})]" if qq else f"[@{nickname}]")
+            else:
+                parts.append(f"[@{qq or '未知用户'}]")
         elif segment_type == "forward":
             # 合并转发：调 NapCat get_forward_msg 拉取子消息并规范展开（支持嵌套）
             forward_id = str(data.get("id") or "").strip()
@@ -185,7 +192,11 @@ async def _format_message_content(
         elif segment_type in {"record", "audio"}:
             parts.append("[语音]")
         elif segment_type == "video":
-            parts.append("[视频]")
+            video_url = data.get("url")
+            if isinstance(video_url, str) and video_url.strip():
+                parts.append(f"[视频 {video_url}]")
+            else:
+                parts.append("[视频]")
         elif segment_type == "face":
             parts.append(f"[表情 {data.get('id', '')}]")
         else:

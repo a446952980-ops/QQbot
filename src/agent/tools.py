@@ -40,14 +40,23 @@ current_image_urls: ContextVar[tuple[str, ...]] = ContextVar("current_image_urls
 # 是否处于被 @ 回复流程：@ 轮次的 tool 发送文本已并入 turn 上下文，不再重复写 background
 _in_at_flow: ContextVar[bool] = ContextVar("in_at_flow", default=False)
 
-# 供 analyze_images 使用的视觉模型；未配置 VISION_MODEL 时退回默认模型
+# 供 analyze_images / analyze_videos 使用的独立多模态模型
 _vision_llm = ChatOpenAI(
     model=config.VISION_MODEL or config.DEFAULT_MODEL,
     temperature=0.1,
     max_tokens=4096,
-    timeout=120,
-    api_key=config.AI_KEY,
-    base_url=config.AI_BASE_URL,
+    timeout=180,
+    api_key=config.VISION_API_KEY,
+    base_url=config.VISION_BASE_URL,
+    extra_body={"thinking": {"type": "disabled"}},
+)
+_video_vision_llm = ChatOpenAI(
+    model=config.VIDEO_VISION_MODEL or config.VISION_MODEL or config.DEFAULT_MODEL,
+    temperature=0.1,
+    max_tokens=4096,
+    timeout=240,
+    api_key=config.VIDEO_VISION_API_KEY,
+    base_url=config.VIDEO_VISION_BASE_URL,
     extra_body={"thinking": {"type": "disabled"}},
 )
 
@@ -269,6 +278,51 @@ async def analyze_images(urls: list[str], prompt: str | None = None) -> str:
     if isinstance(text, list):  # 兼容多段返回，仅取文本部分
         text = "".join(part.get("text", "") for part in text if isinstance(part, dict))
     return str(text) or "Failed: 视觉模型未返回内容。"
+
+
+_DEFAULT_VIDEO_PROMPT = (
+    "请概括这个视频的主要内容：场景、人物 / 主体、关键动作与事件、画面中可见的文字 / 字幕，"
+    "以及任何可能的时间点、背景信息或有趣细节。"
+)
+
+
+@tool
+async def analyze_videos(urls: list[str], prompt: str | None = None) -> str:
+    """
+    看一眼一个或多个视频（传入 URL），返回 VIDEO_VISION_MODEL 的文字描述。
+    调用本工具是内部动作，不需要在群聊里声明“我看看”“看完了”，直接基于
+    描述接话即可。
+
+    默认描述视频内容与事件流；需要特定识别目标（提取字幕、确认画面人物、
+    结合联网结果判断出处、判断是否为鬼畜 / 游戏实况 / 新闻片段等）时用
+    prompt 自定义。
+
+    可用来源（均无需询问群友）：当前消息和引用消息里的视频；上下文历史
+    视频（被 @ 的消息、background 与引用消息以「[视频 URL]」存放，按需取
+    URL）；search / search_videos / crawl_website / scrape_website 得到的
+    视频链接。
+
+    视频 URL 需为可直接访问的 mp4 / webm 等文件地址（NapCat 下发的视频
+    segment 中通常含 url 字段）。不要传本地路径或需要鉴权的内部地址。
+
+    只返回文字描述，不发送任何内容到群聊。视频分析本身不是发言，看完
+    觉得没意思可以沉默，觉得有意思再决定要不要发。
+    """
+    if not urls:
+        return "Failed: 未提供视频 URL。"
+    content: list[dict[str, object]] = [
+        {"type": "text", "text": (prompt or "").strip() or _DEFAULT_VIDEO_PROMPT}
+    ]
+    for url in urls:
+        content.append({"type": "video_url", "video_url": {"url": url}})
+    try:
+        response = await _video_vision_llm.ainvoke([HumanMessage(content=content)])
+    except Exception as e:
+        return f"Failed: {e}"
+    text = response.content
+    if isinstance(text, list):
+        text = "".join(part.get("text", "") for part in text if isinstance(part, dict))
+    return str(text) or "Failed: 视频模型未返回内容。"
 
 
 @tool
@@ -516,62 +570,72 @@ async def _run_image_generation(
     )
 
 
-_MUSIC_SUNG_TAG_RE = re.compile(r"\[[^\]]*\]")
-_MUSIC_HANZI_RE = re.compile(r"[\u4e00-\u9fff]")
-
 # ---- 群级音乐生成开关（/music_on [-N] 开启、/music_off 关闭；服务启动时默认全部关闭） ----
 # group_id -> 剩余可用次数；None 表示不限次数。不在表中的群 = 关闭。
+# 限次额度用尽后仍保留条目（剩余 0），以保持工具持续注册、调用时直接返回已达上限。
 _MUSIC_ENABLED_GROUPS: dict[int, int | None] = {}
+# group_id -> 开启时设置的总次数上限（仅用于提示文案）
+_MUSIC_LIMITS: dict[int, int] = {}
 
 
 def is_music_enabled(group_id: int) -> bool:
-    """该群是否已开启音乐生成工具（@ 流程动态注册 generate_music 的依据）。"""
+    """该群是否已开启音乐生成工具（@ 流程动态注册 generate_music 的依据）。
+
+    限次额度用尽后仍返回 True：工具保持注册，由调用方返回「已达上限」提示。
+    """
     return int(group_id) in _MUSIC_ENABLED_GROUPS
+
+
+def is_music_quota_exhausted(group_id: int) -> bool:
+    """该群音乐生成限次额度是否已用尽（不限次数的群永不耗尽）。"""
+    return _MUSIC_ENABLED_GROUPS.get(int(group_id)) == 0
+
+
+def music_quota_limit(group_id: int) -> int | None:
+    """该群开启音乐生成时设置的总次数上限（不限次或未设置返回 None）。"""
+    return _MUSIC_LIMITS.get(int(group_id))
 
 
 def set_music_enabled(group_id: int, quota: int | None) -> None:
     """开启某群音乐生成；quota 为剩余次数（None 不限）。"""
-    _MUSIC_ENABLED_GROUPS[int(group_id)] = quota
+    gid = int(group_id)
+    _MUSIC_ENABLED_GROUPS[gid] = quota
+    if quota is None:
+        _MUSIC_LIMITS.pop(gid, None)
+    else:
+        _MUSIC_LIMITS[gid] = quota
 
 
 def set_music_disabled(group_id: int) -> None:
-    _MUSIC_ENABLED_GROUPS.pop(int(group_id), None)
+    gid = int(group_id)
+    _MUSIC_ENABLED_GROUPS.pop(gid, None)
+    _MUSIC_LIMITS.pop(gid, None)
 
 
 def _consume_music_quota(group_id: int) -> int | None:
-    """成功提交一次音乐生成时扣减配额；归零自动关闭。返回扣减后剩余次数（None=不限/已关闭）。"""
+    """成功提交一次音乐生成时扣减配额（最低到 0，不清除条目）。返回剩余次数（None=不限）。"""
     gid = int(group_id)
     remaining = _MUSIC_ENABLED_GROUPS.get(gid)
     if remaining is None:
-        return None  # 不限次数或已关闭
-    remaining -= 1
-    if remaining <= 0:
-        _MUSIC_ENABLED_GROUPS.pop(gid, None)  # 达到次数自动置为 off
-        return 0
-    _MUSIC_ENABLED_GROUPS[gid] = remaining
+        return None  # 不限次数或未开启
+    remaining = max(remaining - 1, 0)
+    _MUSIC_ENABLED_GROUPS[gid] = remaining  # 归零后仍保留：工具继续注册，调用返回已达上限
     return remaining
-
-
-def _count_sung_words(lyrics: str) -> int:
-    """"实际演唱"字数：去掉结构标签后，英文按词数 + 中文按字数（汉字逐个计）合并统计。"""
-    text = _MUSIC_SUNG_TAG_RE.sub(" ", lyrics)
-    english_words = re.findall(r"[A-Za-z0-9']+", text)
-    return len(english_words) + len(_MUSIC_HANZI_RE.findall(text))
 
 
 _MUSIC_TOOL_DOC = """用虚拟歌手音色（persona_music）AI 生成一首歌，仅支持群聊被 @ 场景。
 
-这是严格的自定义歌词模式：歌词会逐字唱出来，所以**词数和时长必须对得上、绝不能太短**。
-中英文歌词都支持（也可中英混排，但一段内尽量统一语言）。
+这是严格的自定义歌词模式：歌词会逐字唱出来，写的段落多少直接决定曲长。
+中/英/俄/日等多语言歌词都支持（也可混排，但一段内尽量统一语言）。
 
 写词规范（Suno）：
 - 每段用结构标签单开一行分隔。常用标签不限于这些，按需选用、不必全用：
   [Intro] / [Verse] / [Pre-Chorus] / [Chorus] / [Post-Chorus] / [Bridge] / [Hook] /
   [Refrain] / [Interlude] / [Instrumental] / [Solo] / [Breakdown] / [Break] / [Drop] /
-  [Build] / [Outro] / [End] / [fade to end]。标签本身不唱、不计字数。
-- **时长下限 2 分半**：duration 必须 ≥ 150 秒（≤ 360）。去掉标签后「字数」必须 ≥ duration
-  （约 1 词或 1 字/秒），否则会被拒绝并提示补写。参考密度：英文约 60~90 词/分钟
-  （150 秒 ≈ 150~225 词），中文约 70~100 字/分钟（150 秒 ≈ 175~250 字），宁多勿少。
+  [Build] / [Outro] / [End] / [fade to end]。标签本身不唱。
+- **时长由 sonic 模型自动判断**：不再传 duration，歌词体量直接决定曲长。想要更长的歌（≈3 分钟以上）
+  就把主歌+副歌+桥段写足；只写一两段会生成得很短。参考密度：英文约 60~90 词/分钟，中文约 70~100
+  字/分钟。
 - 结构标签建议保持英文（即使歌词是中文），辨识更稳；中文歌词用逗号/句号断气口，别整段不加标点。
 - tags 用 4~8 个简洁描述词（风格/情绪/乐器/人声），如 "dream pop, ethereal female vocal,
   breathy, shimmering synth, 84 bpm"；title 短（≤80 字符）。不要用 emoji 或 markdown。
@@ -585,14 +649,14 @@ _MUSIC_TOOL_DOC = """用虚拟歌手音色（persona_music）AI 生成一首歌�
 
 Args:
     title: 歌名（≤80 字符）。
-    lyrics: 完整歌词（中文/英文均可），含结构标签，去标签后字数需 ≥ duration。
+    lyrics: 完整歌词（中文/英文等多语言均可），含结构标签，篇幅决定曲长。
     tags: 风格描述，逗号分隔（如 "pop, dreamy, female vocal"）。
-    duration: 目标时长（秒），整数，150~360；至少 2 分半。
     mv: 模型版本，默认 sonic-v6。
     negative_tags: 可选，要排除的风格/元素。
     style_weight: 可选 0~1，风格遵循强度。
     weirdness_constraint: 可选 0~1，创意/随机度。
-    vocal_gender: 可选 "f"（女声）/ "m"（男声）。
+
+人声固定为女声（vocal_gender = "f"），无需在 tags 里特别注明性别。
 """
 
 
@@ -601,12 +665,10 @@ async def generate_music(
     title: str,
     lyrics: str,
     tags: str,
-    duration: int = 180,
     mv: str = "sonic-v6",
     negative_tags: str | None = None,
     style_weight: float | None = None,
     weirdness_constraint: float | None = None,
-    vocal_gender: Literal["f", "m"] | None = "f",
 ) -> str:
     title = (title or "").strip()
     lyrics = (lyrics or "").strip()
@@ -621,19 +683,6 @@ async def generate_music(
         return "Failed: 缺少歌词 lyrics。"
     if mv not in sonic_music.VALID_MV:
         return f"Failed: mv 无效，可选：{', '.join(sorted(sonic_music.VALID_MV))}。"
-    if not isinstance(duration, int) or isinstance(duration, bool):
-        return "Failed: duration 必须是整数秒（如 180）。"
-    if duration < 150:
-        return f"Failed: duration 过短，至少 150 秒（2分半），当前 {duration}。"
-    if duration > 360:
-        return f"Failed: duration 超出上限 360 秒，当前 {duration}。"
-    sung_words = _count_sung_words(lyrics)
-    if sung_words < duration:
-        return (
-            f"Failed: 歌词太短。时长 {duration} 秒至少需要 {duration} 个歌词词"
-            f"（约 1 词/秒、≈60 词/分钟），当前去掉标签后仅 {sung_words} 词。"
-            "请补写主歌/副歌段落，确保词数与时长匹配。"
-        )
     if not config.MUSIC_API_PERSONA_ID:
         return "Failed: 未配置 MUSIC_API_PERSONA_ID（虚拟歌手 persona_id）。"
 
@@ -643,6 +692,13 @@ async def generate_music(
         return "Failed: 音乐生成仅支持在被 @ 的群聊回复中使用。"
     if not is_music_enabled(group_id):
         return "Failed: 本群音乐生成未开启（管理员可用 /music_on 开启）。"
+    if is_music_quota_exhausted(group_id):
+        limit = music_quota_limit(group_id)
+        limit_text = f"（{limit}）" if limit is not None else ""
+        return (
+            f"Failed: 本群该工具已达到限制{limit_text}，本次不启动后台任务。"
+            "请直接告知用户音乐生成次数已用完，不要再承诺生成。"
+        )
     sender_id = current_sender_id.get()
 
     payload = {
@@ -653,7 +709,7 @@ async def generate_music(
         "title": title,
         "tags": tags,
         "prompt": lyrics,  # custom_mode(true) 下 prompt 即要被演唱的歌词
-        "duration": duration,
+        "vocal_gender": "f",  # 固定女声（persona 音色），不再由模型选择
     }
     if negative_tags and negative_tags.strip():
         payload["negative_tags"] = negative_tags.strip()
@@ -661,24 +717,24 @@ async def generate_music(
         payload["style_weight"] = style_weight
     if weirdness_constraint is not None:
         payload["weirdness_constraint"] = weirdness_constraint
-    if vocal_gender in ("f", "m"):
-        payload["vocal_gender"] = vocal_gender
 
     followup = {
         "title": title,
         "tags": tags,
-        "duration": duration,
         "lyrics_preview": lyrics[:400],
     }
     remaining = _consume_music_quota(group_id)
     asyncio.create_task(
         _run_music_generation(group_id, sender_id, payload, followup, websocket)
     )
-    quota_note = (
-        "本群本次为限次额度内的最后一次，已自动关闭。"
-        if remaining == 0
-        else (f"本群剩余 {remaining} 次。" if remaining is not None else "")
-    )
+    if remaining == 0:
+        # 不提示“已用尽”：提示会让模型直接跳过调用、改用聊天敷衍，
+        # 保留工具注册并让它照常调用，由工具返回「已达到限制」写入日志并转告用户
+        quota_note = ""
+    elif remaining is not None:
+        quota_note = f"本群剩余 {remaining} 次。"
+    else:
+        quota_note = ""
     return (
         "音乐生成任务已在后台启动（约两分钟，通常生成 2 条）。"
         "现在请以你的人设口吻自然、简短地回应用户，不要生硬地说「已提交」，"
@@ -707,7 +763,6 @@ async def _run_music_generation(
     task_args = {
         "title": payload.get("title"),
         "tags": payload.get("tags"),
-        "duration": payload.get("duration"),
         "mv": payload.get("mv"),
         "persona_id": payload.get("persona_id"),
     }
@@ -722,6 +777,21 @@ async def _run_music_generation(
     _log_music_task_result(f"已创建任务 task_id={task_id}", task_args)
     try:
         items = await sonic_music.poll_task_until_done(task_id)
+    except sonic_music.MusicCopyrightError as error:
+        # 歌词命中上游版权校验（不可重试、已自动退款）：群里直接告知，不再重试
+        print(f"音乐生成被版权拦截 group_id={group_id} task_id={task_id}: {error}")
+        _log_music_task_result(
+            f"<版权拦截 task_id={task_id}: {error}>", task_args
+        )
+        try:
+            await interaction.send_group_msg(
+                group_id,
+                f"{task_args.get('title') or payload.get('title') or ''}版权规避拉豆",
+                websocket=websocket,
+            )
+        except Exception as send_error:  # noqa: BLE001
+            print(f"版权提示发送失败 group_id={group_id}: {send_error}")
+        return
     except Exception as error:
         print(f"音乐生成失败 group_id={group_id} task_id={task_id}: {error}")
         _log_music_task_result(
@@ -757,6 +827,8 @@ async def _run_music_generation(
             print(f"音乐封面发送失败 group_id={group_id}: {error}")
     # 收尾：在发起任务的群内单独调用一次模型，告知「唱完了」并自由输出一条消息
     followup["generated"] = len(songs)
+    # 时长由上游自动决定，取实际生成结果里的时长（可能不存在）
+    followup["duration"] = songs[0].get("duration") or ""
     try:
         from .init_llm import default_group_agent
 
@@ -849,7 +921,8 @@ tools_lst = [
     scrape_website,
     search_images,
     analyze_images,
-    generate_image,
+    analyze_videos,
+    # generate_image,
     generate_music,
 ]
 
@@ -859,6 +932,7 @@ interjection_tools_lst = [
     qq_send_group_msg_voice,
     # qq_send_group_ai_record,
     analyze_images,
+    analyze_videos,
     qq_send_group_emotion_face2,
     qq_group_poke,
     qq_send_qzone_msg,
@@ -900,10 +974,11 @@ fresh_tools_lst = [
     search,
     search_images,
     scrape_website,
-    analyze_images,  # 识图不受次数限制（见其注释），豁免调用上限
+    analyze_images,   # 识图不受次数限制（见其注释），豁免调用上限
+    analyze_videos,   # 视频分析同上，豁免调用上限
 ]
 fresh_tools_lst = [
-    t if t is analyze_images else _wrap_with_call_cap(t, _FRESH_TOOL_CALL_CAP)
+    t if t in (analyze_images, analyze_videos) else _wrap_with_call_cap(t, _FRESH_TOOL_CALL_CAP)
     for t in fresh_tools_lst
 ]
 

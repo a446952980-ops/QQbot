@@ -43,6 +43,25 @@ def _auth_headers() -> dict:
     }
 
 
+class MusicCopyrightError(RuntimeError):
+    """歌词命中版权校验被上游拒绝（reason_code=copyright，不可重试，已自动退款）。
+
+    上游返回形如：
+    {"type": "forbidden", "message": "Your lyrics contain copyrighted material...",
+     "already_refunded": true, "reason_code": "copyright", "retriable": false}
+    """
+
+
+def _is_copyright_forbidden(obj: object) -> bool:
+    """判断响应（根级或单个 clip）是否为版权违规拒绝。"""
+    if not isinstance(obj, dict):
+        return False
+    if obj.get("reason_code") == "copyright":
+        return True
+    message = str(obj.get("message") or "")
+    return obj.get("type") == "forbidden" and "copyright" in message.lower()
+
+
 async def create_persona_music(payload: dict) -> str:
     """创建 persona_music 任务，返回 task_id。"""
     async with httpx.AsyncClient(timeout=60) as client:
@@ -66,6 +85,7 @@ async def get_task(task_id: str) -> dict | None:
     """查询音乐任务结果。
 
     HTTP 202 / body 中 type=not_ready 表示任务尚未生成完毕，返回 None 继续轮询；
+    版权违规（reason_code=copyright）抛 MusicCopyrightError；
     其余非 200 才视为真实错误抛异常。
     """
     async with httpx.AsyncClient(timeout=60) as client:
@@ -82,6 +102,8 @@ async def get_task(task_id: str) -> dict | None:
     data = response.json()
     if data.get("type") == "not_ready":
         return None
+    if _is_copyright_forbidden(data):
+        raise MusicCopyrightError(str(data.get("message") or "歌词版权违规"))
     return data
 
 
@@ -92,11 +114,23 @@ async def poll_task_until_done(
 
     文档建议轮询间隔 15-25s。生成通常约两分钟，这里默认最多等 10 分钟。
     HTTP 202（not_ready）视为未完成，继续等待，不算错误。
+    歌词版权违规抛 MusicCopyrightError（不可重试，已退款）。
     """
     deadline = time.time() + timeout
     while True:
         resp = await get_task(task_id)
+        if _is_copyright_forbidden(resp):
+            raise MusicCopyrightError(
+                str((resp or {}).get("message") or "歌词版权违规")
+            )
         items = (resp or {}).get("data") or []
+        for item in items:
+            if _is_copyright_forbidden(item) or (
+                item.get("state") == "failed" and _is_copyright_forbidden(item.get("error"))
+            ):
+                raise MusicCopyrightError(
+                    str(item.get("message") or item.get("error") or "歌词版权违规")
+                )
         if items and all(
             it.get("state") in ("succeeded", "failed") for it in items
         ):

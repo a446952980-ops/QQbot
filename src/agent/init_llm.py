@@ -98,12 +98,14 @@ _MUSIC_COMPLETED_PROMPT = """
 
 
 def _build_music_completed_human_content(group_id: int, song_info: dict) -> str:
+    duration = song_info.get("duration")
+    duration_line = f"- 时长约: {duration} 秒\n" if duration else ""
     return (
         "唱完了。—— 你刚在本群完成了一次 AI 音乐创作，封面图和音乐语音已经发出去了。\n"
         f"- group_id: {group_id}\n"
         f"- 歌名: {song_info.get('title', '')}\n"
         f"- 风格: {song_info.get('tags', '')}\n"
-        f"- 时长约: {song_info.get('duration', '')} 秒\n"
+        f"{duration_line}"
         f"- 实际生成: {song_info.get('generated', '')} 条\n"
         f"- 歌词（节选）: {song_info.get('lyrics_preview', '')}\n"
         "请以人设口吻自由地在群里说一句「唱完了」或对这首歌的感想（1 条消息即可）。"
@@ -312,9 +314,12 @@ def _build_compression_model() -> ChatOpenAI:
     )
 
 
-async def _log_thinking(group_id: int, result: dict) -> None:
+async def _log_thinking(
+    group_id: int, result: dict, *, send_forward: bool = True
+) -> None:
     """把本次模型调用响应中的 thinking 内容（reasoning_content）追加写入
-    data/thinking.log；仅在 thinking 模式开启且响应携带思维链时写入。"""
+    data/thinking.log；仅在 thinking 模式开启且响应携带思维链时写入。
+    send_forward=False 时只写日志，不以合并转发形式发到群里（/thinking -v）。"""
     try:
         from .tools import _sanitize_log_text
     except Exception:
@@ -332,6 +337,8 @@ async def _log_thinking(group_id: int, result: dict) -> None:
     with open(_THINKING_LOG_PATH, "a", encoding="utf-8") as f:
         for entry in entries:
             f.write(entry + "\n")
+    if not send_forward:
+        return  # 静默模式（/thinking -v）：只写日志，不发合并转发
     # 同步以合并转发消息发送思考过程（失败不影响主流程）
     texts = [
         getattr(msg, "additional_kwargs", {}).get("reasoning_content", "")
@@ -356,10 +363,18 @@ class QQGroupAgent:
         )
         # (提示词变量名, 用途) -> agent 实例；按 (群当前提示词, 是否视觉/是否插话) 懒创建并缓存
         self._agent_cache: dict[tuple[str, str], object] = {}
+        # 思考过程是否以合并转发形式发到群里（/thinking -v 置为静默，仅写 data/thinking.log）
+        self._thinking_forward = True
 
     # ---- thinking 模式（默认关闭；/thinking 指令切换） ----
     def is_thinking_enabled(self) -> bool:
         return self.model.extra_body["thinking"]["type"] == "enabled"
+
+    def is_thinking_forward_enabled(self) -> bool:
+        return self._thinking_forward
+
+    def set_thinking_forward_enabled(self, enabled: bool) -> None:
+        self._thinking_forward = enabled
 
     def set_thinking_enabled(self, enabled: bool) -> None:
         """切换主模型思考模式；重建模型实例并清空 agent 缓存（性格等由 mode 决定，不受影响）。"""
@@ -367,6 +382,9 @@ class QQGroupAgent:
             return
         self.model = _build_chat_model(config.DEFAULT_MODEL, thinking=enabled)
         self._agent_cache.clear()
+        if enabled:
+            # 常规开启思考：思考过程恢复默认发送（/thinking -v 会在之后单独置为静默）
+            self._thinking_forward = True
 
     def _get_chat_agent(self, prompt_var_name: str, *, vision: bool, music: bool):
         """普通 @ 回复 / 定时群发 agent；vision=True 时用视觉模型；
@@ -460,7 +478,9 @@ class QQGroupAgent:
                         ]
                     }
                 )
-                await _log_thinking(group_id, result)
+                await _log_thinking(
+                    group_id, result, send_forward=self.is_thinking_forward_enabled()
+                )
         finally:
             _unregister_invocation(group_id, task)
 
@@ -528,7 +548,9 @@ class QQGroupAgent:
                         ]
                     }
                 )
-                await _log_thinking(group_id, result)
+                await _log_thinking(
+                    group_id, result, send_forward=self.is_thinking_forward_enabled()
+                )
         finally:
             _unregister_invocation(group_id, task)
 
@@ -564,7 +586,9 @@ class QQGroupAgent:
         try:
             async with self._inv_lock:
                 result = await agent.ainvoke({"messages": [HumanMessage(content=content)]})
-                await _log_thinking(group_id, result)
+                await _log_thinking(
+                    group_id, result, send_forward=self.is_thinking_forward_enabled()
+                )
         finally:
             _unregister_invocation(group_id, task)
 
@@ -645,7 +669,9 @@ class QQGroupAgent:
         try:
             async with self._inv_lock:
                 result = await agent.ainvoke({"messages": messages_in})
-                await _log_thinking(group_id, result)
+                await _log_thinking(
+                    group_id, result, send_forward=self.is_thinking_forward_enabled()
+                )
         finally:
             _unregister_invocation(group_id, task)
         messages_full = result.get("messages", [])
@@ -689,7 +715,9 @@ class QQGroupAgent:
         try:
             async with self._inv_lock:
                 result = await agent.ainvoke({"messages": messages_in})
-                await _log_thinking(group_id, result)
+                await _log_thinking(
+                    group_id, result, send_forward=self.is_thinking_forward_enabled()
+                )
         finally:
             _unregister_invocation(group_id, task)
         messages_full = result.get("messages", [])
