@@ -1,6 +1,6 @@
 from typing import Literal, Sequence
 from urllib.parse import unquote, urlparse
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from contextvars import ContextVar
 from datetime import datetime
 import asyncio
@@ -8,6 +8,7 @@ import json
 import os
 import random
 import re
+import shutil
 import time
 
 from langchain.tools import tool
@@ -19,7 +20,7 @@ from tavily import AsyncTavilyClient
 from ..action import interaction
 from ..qq_ws_context import current_qq_websocket
 from ..tts.client import synthesize_to_mp3 as _tts_synthesize_to_mp3
-from . import aliyun_image_gen, sonic_music, volces_image_gen
+from . import aliyun_image_gen, qq_cover, sonic_music, volces_image_gen
 from .conversation_history import append_background_message
 
 # 生图平台按 config.IMAGE_GEN_PLATFORM 分发（aliyun / volc），同签名可互换
@@ -837,6 +838,142 @@ async def _run_music_generation(
         print(f"音乐完成收尾模型调用失败 group_id={group_id}: {error}")
 
 
+# ---- QQ 音乐 AI 翻唱（单轮 @ 对话最多调用一次） ----
+# 当前轮涉及的 QQ 音乐卡片（由 init_llm.ainvoke_group_at 从消息/引用中收集后设置）
+current_music_cards: ContextVar[tuple[dict, ...]] = ContextVar(
+    "current_music_cards", default=()
+)
+# 单轮翻唱次数：同 _send_msg_state，持共享可变列表，工具内原地累加
+_cover_state: ContextVar[list | None] = ContextVar("cover_state", default=None)
+_COVER_MAX_PER_TURN = 1
+_COVER_ROOT = Path("data/cover")
+
+
+def _bump_cover_count() -> int:
+    state = _cover_state.get()
+    if state is None:
+        state = [0]
+        _cover_state.set(state)
+    state[0] += 1
+    return state[0]
+
+
+_COVER_TOOL_DOC = """把 QQ 音乐卡片里分享的那首歌做成 AI 翻唱（换成本群虚拟歌手音色，同时保留原曲伴奏）。
+
+触发时机：用户 @ 你时附带了 QQ 音乐分享卡片，或引用的消息是一条 QQ 音乐分享卡片，
+并且表达了「翻唱 / 你唱一下 / 换你的声音唱」这类意思时调用。没有 QQ 音乐卡片时不要调用。
+通常不需要传参：系统会自动取本轮消息或引用消息里的歌曲（songmid）。
+
+Args:
+    songmid: 可选，QQ 音乐歌曲 mid（如 "002oC6Mw1jFG40"）。留空则自动取本轮上下文中的卡片。
+"""
+
+
+@tool(description=_COVER_TOOL_DOC)
+async def cover_qq_music(songmid: str = "") -> str:
+    if _bump_cover_count() > _COVER_MAX_PER_TURN:
+        return (
+            "Failed: 单轮 @ 对话最多只能翻唱一次，本轮已调用过本工具。"
+            "不要再调用，直接结束本轮回复。"
+        )
+
+    cards = current_music_cards.get()
+    raw = (songmid or "").strip()
+    mid: str | None = None
+    if raw:
+        mid = qq_cover.extract_songmid(raw)
+        if not mid and re.fullmatch(r"[0-9A-Za-z]{6,24}", raw):
+            mid = raw
+    card: dict | None = None
+    if not mid and cards:
+        card = cards[0]
+        mid = card.get("songmid")
+    if not mid:
+        return "Failed: 没有找到 QQ 音乐卡片（songmid），无法翻唱。"
+    if card is None:
+        card = next((c for c in cards if c.get("songmid") == mid), None)
+
+    group_id = current_group_id.get()
+    websocket = current_qq_websocket.get()
+    if group_id is None or websocket is None:
+        return "Failed: 音乐翻唱仅支持在被 @ 的群聊回复中使用。"
+    if not config.ARPEGGI_API_KEY:
+        return "Failed: 翻唱未配置：需要环境变量 ARPEGGI_API_KEY。"
+    if not config.ARPEGGI_VOICE_MODEL_ID:
+        return "Failed: 翻唱未配置：需要环境变量 ARPEGGI_VOICE_MODEL_ID。"
+
+    title = str((card or {}).get("title") or "")
+    singer = str((card or {}).get("singer") or "")
+    workdir = _COVER_ROOT / f"{group_id}_{int(time.time())}_{mid}"
+    asyncio.create_task(
+        _run_cover(
+            group_id=group_id,
+            songmid=str(mid),
+            title=title,
+            singer=singer,
+            workdir=workdir,
+            websocket=websocket,
+        )
+    )
+    return (
+        "翻唱任务已在后台启动（约 2~4 分钟）：会自动下载原曲、做声线转换与伴奏分离并合并，"
+        "完成后把翻唱语音发到本群；临时音频会在任务结束后删除。"
+        "现在请以你的人设口吻自然、简短地回应一句（如「这首我来唱」），不要复述流程。"
+    )
+
+
+def _log_cover_task_result(result: str, args: dict) -> None:
+    """翻唱后台任务的各阶段结果写入 tool_calls.log（受 tool 日志开关控制）。"""
+    if _tool_log_enabled:
+        try:
+            _log_tool_call("cover_qq_music[后台任务]", args, result)
+        except Exception as e:
+            print(f"记录工具调用日志出错: {e}")
+
+
+async def _run_cover(
+    *,
+    group_id: int,
+    songmid: str,
+    title: str,
+    singer: str,
+    workdir: Path,
+    websocket,
+) -> None:
+    task_args = {"songmid": songmid, "title": title, "singer": singer}
+    label = title or songmid
+
+    def _log(message: str) -> None:
+        _log_cover_task_result(message, task_args)
+
+    _log(f"开始翻唱：《{label}》 songmid={songmid} 工作目录={workdir.name}")
+    try:
+        url = await qq_cover.get_qq_music_url(songmid, log=_log)
+        suffix = Path(urlparse(url).path).suffix or ".mp3"
+        workdir.mkdir(parents=True, exist_ok=True)
+        source = await qq_cover.download_audio(url, workdir / f"source{suffix}", log=_log)
+        merged = await qq_cover.run_cover(source, workdir, log=_log)
+        await interaction.send_group_msg_record(
+            group_id, str(merged), websocket=websocket
+        )
+        _log("翻唱语音已发送到群")
+    except Exception as error:  # noqa: BLE001
+        print(f"翻唱失败 group_id={group_id} songmid={songmid}: {error}")
+        _log(f"<失败: {type(error).__name__}: {error}>")
+        try:
+            await interaction.send_group_msg(
+                group_id, f"《{label}》翻唱失败：{error}", websocket=websocket
+            )
+        except Exception as send_error:  # noqa: BLE001
+            print(f"翻唱失败提示发送失败 group_id={group_id}: {send_error}")
+    else:
+        _log("翻唱流程结束（已发送）")
+    finally:
+        # 翻唱任务全部结束后删除临时下载的原曲与中间文件
+        shutil.rmtree(workdir, ignore_errors=True)
+        _log(f"已清理临时目录 {workdir.name}")
+
+
 async def _serper_post(endpoint: str, payload: dict) -> dict:
     headers = {"X-API-KEY": config.SERPER_API_KEY, "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=30) as client:
@@ -924,6 +1061,7 @@ tools_lst = [
     analyze_videos,
     # generate_image,
     generate_music,
+    # cover_qq_music,
 ]
 
 # Random interjections only need tools that visibly post to the group.

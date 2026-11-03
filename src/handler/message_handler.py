@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 import config
 
 from ..action import interaction
+from ..agent import qq_cover
 from ..agent.conversation_history import (
     append_background_message,
     mark_forward_blocks,
@@ -125,6 +126,7 @@ async def _format_message_content(
     image_collector: list[tuple[str, str]] | None = None,
     image_label: str = "合并转发内图片",
     block_collector: dict[str, str] | None = None,
+    music_collector: list[dict] | None = None,
 ) -> str:
     if isinstance(message, str):
         return message.strip() or "（无文字内容）"
@@ -197,6 +199,18 @@ async def _format_message_content(
                 parts.append(f"[视频 {video_url}]")
             else:
                 parts.append("[视频]")
+        elif segment_type == "json":
+            # QQ 音乐分享卡片：解析出 songmid 写入文本，供 cover_qq_music 直接取用
+            card = qq_cover.parse_music_card(data.get("data"))
+            if card:
+                if music_collector is not None:
+                    music_collector.append(card)
+                title = card.get("title") or "未知歌曲"
+                singer = f" — {card['singer']}" if card.get("singer") else ""
+                tag = card.get("tag") or "QQ音乐"
+                parts.append(f"[{tag}：{title}{singer} (songmid={card['songmid']})]")
+            else:
+                parts.append("[JSON卡片]")
         elif segment_type == "face":
             parts.append(f"[表情 {data.get('id', '')}]")
         else:
@@ -225,12 +239,30 @@ def _extract_image_urls(message: object, source: str) -> list[tuple[str, str]]:
     return images
 
 
+def _collect_music_cards(message: object) -> list[dict]:
+    """从消息段中收集 QQ 音乐卡片（供 cover_qq_music 自动取歌曲）。"""
+    if not isinstance(message, list):
+        return []
+    cards: list[dict] = []
+    for segment in message:
+        if not isinstance(segment, dict) or segment.get("type") != "json":
+            continue
+        data = segment.get("data")
+        if not isinstance(data, dict):
+            continue
+        card = qq_cover.parse_music_card(data.get("data"))
+        if card:
+            cards.append(card)
+    return cards
+
+
 async def _format_reply_context(
     quoted_message: dict,
     expected_group_id: object,
     image_collector: list[tuple[str, str]] | None = None,
     image_label: str = "引用消息转发内图片",
     block_collector: dict[str, str] | None = None,
+    music_collector: list[dict] | None = None,
 ) -> str:
     quoted_group_id = quoted_message.get("group_id")
     if (
@@ -256,6 +288,7 @@ async def _format_reply_context(
             image_collector=image_collector,
             image_label=image_label,
             block_collector=block_collector,
+            music_collector=music_collector,
         )
     )[:4000]
     return (
@@ -479,6 +512,8 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
                 image_inputs: list[tuple[str, str]] = []
                 current_forward_images: list[tuple[str, str]] = []
                 quoted_blocks: dict[str, str] = {}
+                current_music: list[dict] = []
+                quoted_music: list[dict] = []
                 if reply_id is not None:
                     quoted_message = await interaction.get_msg(reply_id, websocket)
                     if quoted_message is None:
@@ -502,6 +537,7 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
                             image_collector=quoted_forward_images,
                             image_label=f"引用消息转发内图片({quoted_name})",
                             block_collector=quoted_blocks,
+                            music_collector=quoted_music,
                         )
                         image_inputs.extend(
                             _extract_image_urls(
@@ -515,6 +551,7 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
                         segments,
                         image_collector=current_forward_images,
                         block_collector=current_blocks,
+                        music_collector=current_music,
                     )
                     # 本轮展开的转发即将随本条消息写入 @ 轮次：登记展开块；
                     # 被引用转发的历史旧副本在本次模型调用渲染中临时以占位符省略
@@ -524,6 +561,16 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
                         "【当前 @ 消息内容】\n"
                         f"{current_content}"
                     )
+                else:
+                    current_music = _collect_music_cards(segments)
+                    if current_music:
+                        # 无引用时 text 只含纯文本段，补上音乐卡片信息让模型看见歌名
+                        text = (text or "") + "".join(
+                            f"[{c.get('tag') or 'QQ音乐'}：{c.get('title') or '未知歌曲'}"
+                            f"{' — ' + c['singer'] if c.get('singer') else ''}"
+                            f" (songmid={c['songmid']})]"
+                            for c in current_music
+                        )
                 image_inputs.extend(
                     _extract_image_urls(segments, "当前消息中的图片")
                 )
@@ -539,6 +586,7 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
                         event_time=int(event_time),
                         image_inputs=image_inputs,
                         omit_forward_ids=frozenset(quoted_blocks),
+                        music_cards=tuple(current_music + quoted_music),
                     )
                 except Exception as error:
                     if _is_rate_limit_error(error):

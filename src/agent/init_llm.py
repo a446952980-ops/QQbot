@@ -24,11 +24,13 @@ from .conversation_history import (
 )
 from .group_prompt import get_active_prompt_name, get_prompt_text
 from .tools import (
+    _cover_state,
     _fresh_call_state,
     _in_at_flow,
     _send_msg_state,
     current_group_id,
     current_image_urls,
+    current_music_cards,
     current_sender_id,
     fresh_tools_lst,
     interjection_tools_lst,
@@ -627,6 +629,7 @@ class QQGroupAgent:
         event_time: int | None = None,
         image_inputs: list[tuple[str, str]] | None = None,
         omit_forward_ids: frozenset[str] = frozenset(),
+        music_cards: tuple[dict, ...] = (),
     ) -> dict:
         """
         Returns a dict with key `messages` (list of LangChain messages), same shape as
@@ -662,6 +665,8 @@ class QQGroupAgent:
         current_sender_id.set(int(sender_id))
         _in_at_flow.set(True)
         _send_msg_state.set([0])  # 单次模型调用的发送次数限制从头计数
+        _cover_state.set([0])  # 单轮 @ 对话的翻唱次数从头计数
+        current_music_cards.set(music_cards)  # 供 cover_qq_music 自动取卡片歌曲
         current_image_urls.set(
             tuple(url for _, url in image_inputs) if image_inputs else ()
         )

@@ -85,6 +85,17 @@ MUSIC_API_BASE_URL = (
     os.getenv("MUSIC_API_BASE_URL") or "https://api.musicapi.ai"
 ).strip().rstrip("/")
 
+# ---- Arpeggi AI 翻唱（声线转换 + 音轨分离）----
+ARPEGGI_API_KEY = (os.getenv("ARPEGGI_API_KEY") or "").strip()
+ARPEGGI_VOICE_MODEL_ID = (os.getenv("ARPEGGI_VOICE_MODEL_ID") or "").strip()
+ARPEGGI_BASE_URL = (
+    os.getenv("ARPEGGI_BASE_URL") or "https://arpeggi.io/api/kits/v1"
+).strip().rstrip("/")
+
+# QQ 音乐直链接口可选 Cookie（部分歌曲需要登录态才返回 vkey）
+QQ_MUSIC_COOKIE = (os.getenv("QQ_MUSIC_COOKIE") or "").strip()
+
+
 def _parse_int_list(raw: str) -> list[int]:
     ids: list[int] = []
     for part in raw.replace(";", ",").split(","):
