@@ -96,6 +96,31 @@ ARPEGGI_BASE_URL = (
 QQ_MUSIC_COOKIE = (os.getenv("QQ_MUSIC_COOKIE") or "").strip()
 
 
+# ---- 梗识别（src/meme/）：embedding 走 DashScope OpenAI 兼容接口，复用 DASHSCOPE_API_KEY ----
+MEME_EMBEDDING_BASE_URL = (
+    os.getenv("MEME_EMBEDDING_BASE_URL")
+    or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+).strip().rstrip("/")
+MEME_EMBEDDING_MODEL = (
+    os.getenv("MEME_EMBEDDING_MODEL") or "qwen3.7-text-embedding-flash"
+).strip()
+
+
+def _env_number(name: str, default, cast):
+    try:
+        value = cast(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return value if math.isfinite(value) else default
+
+
+MEME_EMBEDDING_DIM = int(_env_number("MEME_EMBEDDING_DIM", 1024, int))
+# 语义兜底命中阈值（余弦相似度）
+MEME_SEMANTIC_THRESHOLD = float(_env_number("MEME_SEMANTIC_THRESHOLD", 0.62, float))
+# 每隔多少次 @ 回复提供一次“可选化用”的梗；<=0 关闭
+MEME_SUGGEST_EVERY = int(_env_number("MEME_SUGGEST_EVERY", 4, int))
+
+
 def _parse_int_list(raw: str) -> list[int]:
     ids: list[int] = []
     for part in raw.replace(";", ",").split(","):

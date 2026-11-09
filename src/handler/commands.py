@@ -19,6 +19,8 @@ from websockets.asyncio.client import ClientConnection
 from ..action import interaction
 from ..agent import conversation_history, group_prompt, tools
 from ..agent.init_llm import cancel_group_invocations, default_group_agent
+from ..meme import matcher as meme_matcher
+from ..meme import store as meme_store
 
 TIMED_MODE_DEFAULT_MINUTES = 10
 
@@ -66,6 +68,7 @@ class GroupCommand(str, Enum):
     STARTUP = "/startup"
     MUSIC_ON = "/music_on"
     MUSIC_OFF = "/music_off"
+    MEME = "/meme"
 
 
 def _apply_timed_mode(
@@ -298,6 +301,64 @@ async def _handle_music_off(
     return True
 
 
+_MEME_USAGE = "用法：/meme 词 | /meme -add 词 释义 | /meme -del 词"
+
+
+async def _handle_meme(
+    rest: str, *, group_id: int, websocket: ClientConnection, sender_id: int | str | None
+) -> bool:
+    """/meme 词：查询；/meme -add 词 释义：添加/覆盖本群词条；/meme -del 词：本群删除/屏蔽。
+
+    rest 为指令后的原始文本（释义可含空格）。所有群友可用，增删只影响本群并写入 meme.log。
+    """
+    operator = str(sender_id or "")
+    parts = rest.split(maxsplit=1)
+    if not parts:
+        reply = _MEME_USAGE
+    elif parts[0] == "-add":
+        body = parts[1].split(maxsplit=1) if len(parts) > 1 else []
+        if len(body) < 2:
+            reply = "格式：/meme -add 词 释义"
+        elif not 2 <= len(body[0]) <= 20:
+            reply = "词需为 2～20 字"
+        elif len(body[1]) > 120:
+            reply = "释义请控制在 120 字以内"
+        else:
+            meme_store.add_group_meme(
+                group_id, body[0], body[1], source="command", operator=operator
+            )
+            reply = f"已记下「{body[0]}」"
+    elif parts[0] == "-del":
+        term = parts[1].strip() if len(parts) > 1 else ""
+        if not term:
+            reply = "格式：/meme -del 词"
+        else:
+            result = meme_store.delete_group_meme(group_id, term, operator=operator)
+            reply = {
+                "deleted": f"已删除「{term}」",
+                "blocked": f"已在本群屏蔽「{term}」",
+            }.get(result or "", f"词库里没有「{term}」")
+    elif parts[0].startswith("-"):
+        reply = _MEME_USAGE
+    else:
+        term = rest.strip()
+        meme = meme_store.resolve(term, group_id)
+        if meme is not None:
+            reply = f"「{meme.term}」{meme.short_meaning(100)}"
+        else:
+            guesses = await meme_matcher.guess_abbreviations(
+                meme_matcher.abbreviation_candidates(term, group_id)
+            )
+            guess = guesses.get(term.lower())
+            reply = (
+                f"「{term}」词库没收录，缩写可能是：{' / '.join(guess)}"
+                if guess
+                else f"词库里没有「{term}」"
+            )
+    await interaction.send_group_msg(group_id, reply, websocket=websocket)
+    return True
+
+
 _COMMAND_HANDLERS: dict[GroupCommand, Callable[..., Awaitable[bool]]] = {
     GroupCommand.SECRET_MODE: _handle_secret_mode,
     GroupCommand.SMART_MODE: _handle_smart_mode,
@@ -340,6 +401,14 @@ async def try_handle_group_command(
     if not stripped.startswith("/"):
         return False
     tokens = stripped.split()
+    if tokens[0] == GroupCommand.MEME.value:
+        # /meme 的释义可含空格，单独解析，不受下方 token 数量限制
+        return await _handle_meme(
+            stripped[len(tokens[0]) :].strip(),
+            group_id=group_id,
+            websocket=websocket,
+            sender_id=sender_id,
+        )
     if len(tokens) > 3:  # 至多 “指令 + 参数 + --empty”，多余 token 一律不触发
         return False
     try:

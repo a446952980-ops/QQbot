@@ -643,11 +643,16 @@ class QQGroupAgent:
         image_inputs: list[tuple[str, str]] | None = None,
         omit_forward_ids: frozenset[str] = frozenset(),
         music_cards: tuple[dict, ...] = (),
+        meme_hints: str = "",
+        meme_suggestion: str = "",
     ) -> dict:
         """
         Returns a dict with key `messages` (list of LangChain messages), same shape as
         `create_agent` / LangGraph agent output. Prepends up to 8 prior turns for this
         group and appends this turn to local cache after completion.
+
+        meme_hints（命中的梗说明）随本轮用户内容写入 history；
+        meme_suggestion（可选化用）只给本轮模型看，不写入 history。
         """
         user_content = _build_group_at_human_content(
             group_id=group_id,
@@ -657,8 +662,13 @@ class QQGroupAgent:
             msg_id=msg_id,
             text=text,
         )
+        if meme_hints:
+            user_content += "\n" + meme_hints + "\n"
+        model_content = user_content
+        if meme_suggestion:
+            model_content += "\n" + meme_suggestion + "\n"
         multimodal_content = _build_multimodal_human_content(
-            user_content, image_inputs
+            model_content, image_inputs
         )
         cached_user_content = user_content
         if image_inputs:

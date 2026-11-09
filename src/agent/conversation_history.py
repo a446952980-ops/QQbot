@@ -193,6 +193,23 @@ def history_as_messages(
         return messages
 
 
+def history_texts(group_id: int) -> tuple[list[str], list[str]]:
+    """只读：返回该群 (群友侧文本[background + @ 用户内容], 机器人侧文本)，按时间排序。"""
+    with _lock:
+        turns = list(_turn_store.get(group_id) or ())
+        background = list(_background_store.get(group_id) or ())
+    user_side = [
+        text
+        for _, text in sorted(
+            [(ts, content) for ts, content in background]
+            + [(ts, user) for ts, user, _ in turns],
+            key=lambda item: item[0],
+        )
+    ]
+    assistant_side = [assistant for _, _, assistant in sorted(turns, key=lambda t: t[0])]
+    return user_side, assistant_side
+
+
 def _clean_cached_assistant_content(content: str) -> str:
     """Strip internal transcript labels from older persisted assistant turns."""
     content = _DSML_TOOL_CALLS_RE.sub("", content)

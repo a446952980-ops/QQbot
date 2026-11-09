@@ -12,3 +12,5 @@ wheels/
 
 # Local-only expression map (canonical data lives in src/agent/face_enum.py)
 face_enum.txt
+
+/data/

@@ -13,6 +13,7 @@ from ..agent.conversation_history import (
     mark_forward_blocks,
 )
 from ..agent.init_llm import default_group_agent, extract_final_assistant_text
+from ..meme import service as meme_service
 from ..qq_ws_context import current_qq_websocket
 from .commands import (
     is_at_reply_enabled,
@@ -299,6 +300,20 @@ async def _format_reply_context(
     )
 
 
+def _plain_text(segments: object) -> str:
+    """只取消息中的文本段（梗识别用，不触发转发展开等网络请求）。"""
+    if not isinstance(segments, list):
+        return segments if isinstance(segments, str) else ""
+    return "".join(
+        seg["data"]["text"]
+        for seg in segments
+        if isinstance(seg, dict)
+        and seg.get("type") == "text"
+        and isinstance(seg.get("data"), dict)
+        and isinstance(seg["data"].get("text"), str)
+    )
+
+
 # 后台随机插话任务的强引用（防止任务未完成即被 GC）
 _interjection_tasks: set[asyncio.Task] = set()
 
@@ -373,6 +388,9 @@ async def _random_interjection(
             interject_quote_images = _extract_image_urls(
                 quoted_segments, f"引用消息中的图片（{quoted_name}）"
             ) + quoted_forward_images
+    interject_hint = meme_service.annotate_message(gid, _plain_text(segments))
+    if interject_hint:
+        interject_text = f"{interject_text}\n{interject_hint}"
     interject_kwargs = dict(
         group_id=int(group_id) if group_id is not None else 0,
         group_name=group_name or "",
@@ -516,12 +534,15 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
             )
             # 该消息写入背景上下文：登记其中转发的展开块，之后被引用时历史中临时省略
             mark_forward_blocks(gid, stored_blocks)
+            # 本地匹配梗，提示随消息写入背景记录
+            bg_hint = meme_service.annotate_message(gid, _plain_text(segments))
             append_background_message(
                 int(group_id) if group_id is not None else 0,
                 int(event_time),
                 "【群聊信息（没有@你）：】\n"
                 f"发送者: {display_name} (QQ: {sender_id or '未知'})\n"
-                f"内容: {content_text}",
+                f"内容: {content_text}"
+                + (f"\n{bg_hint}" if bg_hint else ""),
             )
 
         # 群@
@@ -543,12 +564,14 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
                         segments, block_collector=disabled_blocks
                     )
                     mark_forward_blocks(gid, disabled_blocks)
+                    disabled_hint = meme_service.annotate_message(gid, _plain_text(segments))
                     append_background_message(
                         gid,
                         int(event_time),
                         "【群聊背景消息：被 @ 但 @ 回复已关闭】\n"
                         f"发送者: {sender_name or '未知群成员'} (QQ: {sender_id or '未知'})\n"
-                        f"内容: {disabled_text}",
+                        f"内容: {disabled_text}"
+                        + (f"\n{disabled_hint}" if disabled_hint else ""),
                     )
                     return
                 # await interaction.set_msg_emoji_like(msg_id, websocket)
@@ -561,6 +584,7 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
                 quoted_blocks: dict[str, str] = {}
                 current_music: list[dict] = []
                 quoted_music: list[dict] = []
+                quoted_plain = ""
                 if reply_id is not None:
                     quoted_message = await interaction.get_msg(reply_id, websocket)
                     if quoted_message is None:
@@ -570,6 +594,7 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
                             "引用消息查询失败或不可访问，原文未载入。"
                         )
                     else:
+                        quoted_plain = _plain_text(quoted_message.get("message"))
                         quoted_sender = quoted_message.get("sender")
                         quoted_sender = quoted_sender if isinstance(quoted_sender, dict) else {}
                         quoted_name = (
@@ -622,6 +647,9 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
                     _extract_image_urls(segments, "当前消息中的图片")
                 )
                 image_inputs.extend(current_forward_images)
+                meme_hints, meme_suggestion = await meme_service.build_at_context(
+                    gid, _plain_text(segments), quoted_plain
+                )
                 try:
                     result = await default_group_agent.ainvoke_group_at(
                         group_id=group_id,
@@ -634,6 +662,8 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
                         image_inputs=image_inputs,
                         omit_forward_ids=frozenset(quoted_blocks),
                         music_cards=tuple(current_music + quoted_music),
+                        meme_hints=meme_hints,
+                        meme_suggestion=meme_suggestion,
                     )
                 except Exception as error:
                     if _is_rate_limit_error(error):

@@ -30,6 +30,7 @@ _IMAGE_GENERATOR = (
     else aliyun_image_gen.generate_images
 )
 from .face_enum import list_face_enum_keys, resolve_face
+from ..meme.tools import meme_tools_lst
 
 tavily_client = AsyncTavilyClient(config.TAVILY_KEY)
 
@@ -1062,6 +1063,7 @@ tools_lst = [
     # generate_image,
     generate_music,
     # cover_qq_music,
+    *meme_tools_lst,
 ]
 
 # Random interjections only need tools that visibly post to the group.
