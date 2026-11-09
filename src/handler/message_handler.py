@@ -299,6 +299,114 @@ async def _format_reply_context(
     )
 
 
+# 后台随机插话任务的强引用（防止任务未完成即被 GC）
+_interjection_tasks: set[asyncio.Task] = set()
+
+
+async def _run_random_interjection(event_data: dict, websocket: ClientConnection, **kwargs) -> None:
+    """后台任务入口：兜底记录异常，避免后台任务异常无人处理。"""
+    try:
+        await _random_interjection(event_data, websocket, **kwargs)
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        print(f"随机插话执行失败: {error}")
+
+
+async def _random_interjection(
+    event_data: dict,
+    websocket: ClientConnection,
+    *,
+    segments: list,
+    group_id: object,
+    group_name: str | None,
+    sender_name: str | None,
+    sender_id: object,
+    msg_id: object,
+) -> None:
+    """随机插话（后台任务）：整理当前消息与引用转发后调用插话 agent。"""
+    gid = int(group_id) if group_id is not None else 0
+    # 触发插话后按概率分流：新鲜事分享事件 / 普通插话事件
+    fresh_event = random.random() < config.INTERJECTION_FRESH_EVENT_PROB
+    interject_forward_images: list[tuple[str, str]] = []
+    interject_text = await _format_message_content(
+        segments, image_collector=interject_forward_images
+    )
+    # 引用的合并转发消息：与 @ 流程一致拉取展开（仅当被引用消息含 forward 段）
+    interject_quote_images: list[tuple[str, str]] = []
+    interject_quote_blocks: dict[str, str] = {}
+    reply_id = _extract_reply_message_id(
+        segments, str(event_data.get("raw_message") or "")
+    )
+    if reply_id is not None:
+        quoted_message = await interaction.get_msg(reply_id, websocket)
+        quoted_segments = (
+            quoted_message.get("message")
+            if isinstance(quoted_message, dict)
+            else None
+        )
+        if isinstance(quoted_segments, list) and any(
+            isinstance(seg, dict) and seg.get("type") == "forward"
+            for seg in quoted_segments
+        ):
+            quoted_sender = (
+                quoted_message.get("sender")
+                if isinstance(quoted_message.get("sender"), dict)
+                else {}
+            )
+            quoted_name = (
+                quoted_sender.get("card")
+                or quoted_sender.get("nickname")
+                or "引用用户"
+            )
+            quoted_forward_images: list[tuple[str, str]] = []
+            quote_context = await _format_reply_context(
+                quoted_message,
+                group_id,
+                image_collector=quoted_forward_images,
+                image_label=f"引用消息转发内图片({quoted_name})",
+                block_collector=interject_quote_blocks,
+            )
+            interject_text = (
+                f"{quote_context}\n\n【当前消息内容】\n{interject_text}"
+            )
+            interject_quote_images = _extract_image_urls(
+                quoted_segments, f"引用消息中的图片（{quoted_name}）"
+            ) + quoted_forward_images
+    interject_kwargs = dict(
+        group_id=int(group_id) if group_id is not None else 0,
+        group_name=group_name or "",
+        sender_name=sender_name or "",
+        sender_id=int(sender_id),
+        msg_id=int(msg_id) if msg_id is not None else 0,
+        text=interject_text,
+        image_inputs=interject_quote_images
+        + _extract_image_urls(segments, "当前消息中的图片")
+        + interject_forward_images,
+    )
+    try:
+        if fresh_event:
+            await default_group_agent.ainvoke_fresh_news_interjection(
+                **interject_kwargs,
+                omit_forward_ids=frozenset(interject_quote_blocks),
+            )
+        else:
+            await default_group_agent.ainvoke_random_interjection(
+                **interject_kwargs,
+                omit_forward_ids=frozenset(interject_quote_blocks),
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        print(f"随机插话执行失败: {error}")
+        if _is_rate_limit_error(error):
+            await interaction.send_group_msg(
+                gid, _RATE_LIMIT_REPLY_TEXT, websocket=websocket
+            )
+        elif _is_filtered_content_error(error):
+            await interaction.send_group_msg(gid, _FILTERED_REPLY_TEXT, websocket=websocket)
+
+
 async def handle_message(event_data: dict, websocket: ClientConnection):
     token = current_qq_websocket.set(websocket)
     try:
@@ -376,91 +484,30 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
             str(at_id) == str(self_id) for at_id in at_info if at_id != "all"
         )
         gid = int(group_id) if group_id is not None else 0
+        # 被 @ 的消息走 @ 回复流程，不参与随机插话（避免一条消息回两次）
         if (
-            sender_id is not None
+            not is_at_self
+            and sender_id is not None
             and str(sender_id) != str(self_id)
             and is_interjection_enabled(gid)
             and sender_uid not in config.ACCOUNT_BLACKLIST
             and random.random() < config.RANDOM_INTERJECTION_PROBABILITY
         ):
-            # 触发插话后按概率分流：新鲜事分享事件 / 普通插话事件
-            fresh_event = random.random() < config.INTERJECTION_FRESH_EVENT_PROB
-            interject_forward_images: list[tuple[str, str]] = []
-            interject_text = await _format_message_content(
-                segments, image_collector=interject_forward_images
-            )
-            # 引用的合并转发消息：与 @ 流程一致拉取展开（仅当被引用消息含 forward 段）
-            interject_quote_images: list[tuple[str, str]] = []
-            interject_quote_blocks: dict[str, str] = {}
-            reply_id = _extract_reply_message_id(
-                segments, str(event_data.get("raw_message") or "")
-            )
-            if reply_id is not None:
-                quoted_message = await interaction.get_msg(reply_id, websocket)
-                quoted_segments = (
-                    quoted_message.get("message")
-                    if isinstance(quoted_message, dict)
-                    else None
+            # 后台执行，不阻塞本条消息后续的背景记录 / @ 处理
+            interjection_task = asyncio.create_task(
+                _run_random_interjection(
+                    event_data,
+                    websocket,
+                    segments=segments,
+                    group_id=group_id,
+                    group_name=group_name,
+                    sender_name=sender_name,
+                    sender_id=sender_id,
+                    msg_id=msg_id,
                 )
-                if isinstance(quoted_segments, list) and any(
-                    isinstance(seg, dict) and seg.get("type") == "forward"
-                    for seg in quoted_segments
-                ):
-                    quoted_sender = (
-                        quoted_message.get("sender")
-                        if isinstance(quoted_message.get("sender"), dict)
-                        else {}
-                    )
-                    quoted_name = (
-                        quoted_sender.get("card")
-                        or quoted_sender.get("nickname")
-                        or "引用用户"
-                    )
-                    quoted_forward_images: list[tuple[str, str]] = []
-                    quote_context = await _format_reply_context(
-                        quoted_message,
-                        group_id,
-                        image_collector=quoted_forward_images,
-                        image_label=f"引用消息转发内图片({quoted_name})",
-                        block_collector=interject_quote_blocks,
-                    )
-                    interject_text = (
-                        f"{quote_context}\n\n【当前消息内容】\n{interject_text}"
-                    )
-                    interject_quote_images = _extract_image_urls(
-                        quoted_segments, f"引用消息中的图片（{quoted_name}）"
-                    ) + quoted_forward_images
-            interject_kwargs = dict(
-                group_id=int(group_id) if group_id is not None else 0,
-                group_name=group_name or "",
-                sender_name=sender_name or "",
-                sender_id=int(sender_id),
-                msg_id=int(msg_id) if msg_id is not None else 0,
-                text=interject_text,
-                image_inputs=interject_quote_images
-                + _extract_image_urls(segments, "当前消息中的图片")
-                + interject_forward_images,
             )
-            try:
-                if fresh_event:
-                    await default_group_agent.ainvoke_fresh_news_interjection(
-                        **interject_kwargs,
-                        omit_forward_ids=frozenset(interject_quote_blocks),
-                    )
-                else:
-                    await default_group_agent.ainvoke_random_interjection(
-                        **interject_kwargs,
-                        omit_forward_ids=frozenset(interject_quote_blocks),
-                    )
-            except Exception as error:
-                print(f"随机插话执行失败: {error}")
-                gid = int(group_id) if group_id is not None else 0
-                if _is_rate_limit_error(error):
-                    await interaction.send_group_msg(
-                        gid, _RATE_LIMIT_REPLY_TEXT, websocket=websocket
-                    )
-                elif _is_filtered_content_error(error):
-                    await interaction.send_group_msg(gid, _FILTERED_REPLY_TEXT, websocket=websocket)
+            _interjection_tasks.add(interjection_task)
+            interjection_task.add_done_callback(_interjection_tasks.discard)
         if not is_at_self:
             display_name = sender.get("card") or sender_name or "未知群成员"
             stored_blocks: dict[str, str] = {}

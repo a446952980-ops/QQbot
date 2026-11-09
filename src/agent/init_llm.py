@@ -357,7 +357,8 @@ class QQGroupAgent:
     """LangChain agent for QQ group @-mentions; `ainvoke` returns a `messages` dict like LangGraph."""
 
     def __init__(self) -> None:
-        self._inv_lock = asyncio.Lock()
+        # 按群划分的调用锁：同群内串行（避免回复交错），不同群互不阻塞
+        self._group_locks: dict[int, asyncio.Lock] = {}
         self.model = _build_chat_model(config.DEFAULT_MODEL, thinking=False)
         # 仅在消息携带图片时使用；未配置 VISION_MODEL 时退回默认模型
         self.vision_model = _build_chat_model(
@@ -367,6 +368,12 @@ class QQGroupAgent:
         self._agent_cache: dict[tuple[str, str], object] = {}
         # 思考过程是否以合并转发形式发到群里（/thinking -v 置为静默，仅写 data/thinking.log）
         self._thinking_forward = True
+
+    def _group_lock(self, group_id: int) -> asyncio.Lock:
+        lock = self._group_locks.get(int(group_id))
+        if lock is None:
+            lock = self._group_locks[int(group_id)] = asyncio.Lock()
+        return lock
 
     # ---- thinking 模式（默认关闭；/thinking 指令切换） ----
     def is_thinking_enabled(self) -> bool:
@@ -464,10 +471,13 @@ class QQGroupAgent:
         agent = self._get_interjection_agent(
             get_active_prompt_name(group_id), vision=bool(image_inputs)
         )
+        lock = self._group_lock(group_id)
+        if lock.locked():
+            return  # 本群已有调用在进行（如正在回复 @），插话直接放弃，不排队
         _send_msg_state.set([0])  # 单次模型调用的发送次数限制从头计数
         task = _register_invocation(group_id)
         try:
-            async with self._inv_lock:
+            async with lock:
                 result = await agent.ainvoke(
                     {
                         "messages": [
@@ -533,11 +543,14 @@ class QQGroupAgent:
             f"- latest_group_message: {text}\n"
         )
         agent = self._get_fresh_agent(get_active_prompt_name(group_id))
+        lock = self._group_lock(group_id)
+        if lock.locked():
+            return  # 本群已有调用在进行，插话直接放弃，不排队
         _fresh_call_state.set([0])  # 本次插话的 5 次工具调用上限从头计数
         _send_msg_state.set([0])
         task = _register_invocation(group_id)
         try:
-            async with self._inv_lock:
+            async with lock:
                 result = await agent.ainvoke(
                     {
                         "messages": [
@@ -586,7 +599,7 @@ class QQGroupAgent:
         _send_msg_state.set([0])  # 单次模型调用的发送次数限制从头计数
         task = _register_invocation(group_id)
         try:
-            async with self._inv_lock:
+            async with self._group_lock(group_id):
                 result = await agent.ainvoke({"messages": [HumanMessage(content=content)]})
                 await _log_thinking(
                     group_id, result, send_forward=self.is_thinking_forward_enabled()
@@ -672,7 +685,7 @@ class QQGroupAgent:
         )
         task = _register_invocation(group_id)
         try:
-            async with self._inv_lock:
+            async with self._group_lock(group_id):
                 result = await agent.ainvoke({"messages": messages_in})
                 await _log_thinking(
                     group_id, result, send_forward=self.is_thinking_forward_enabled()
@@ -718,7 +731,7 @@ class QQGroupAgent:
         _send_msg_state.set([0])  # 单次模型调用的发送次数限制从头计数
         task = _register_invocation(group_id)
         try:
-            async with self._inv_lock:
+            async with self._group_lock(group_id):
                 result = await agent.ainvoke({"messages": messages_in})
                 await _log_thinking(
                     group_id, result, send_forward=self.is_thinking_forward_enabled()
@@ -737,7 +750,7 @@ class QQGroupAgent:
         return result
 
     def _maybe_trigger_compression(self, group_id: int) -> None:
-        """@ 轮次达到上限时，后台启动一次非阻塞的对话压缩（不 await、不占用 _inv_lock）。"""
+        """@ 轮次达到上限时，后台启动一次非阻塞的对话压缩（不 await、不占用群调用锁）。"""
         snapshot = try_begin_compression(group_id)
         if snapshot is None:
             return
