@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime
 
 import httpx
@@ -14,6 +15,8 @@ import config
 from . import learn, matcher, store
 
 _HOT_GROUP_ID = 0  # 热榜候选在候选表中的占位群号
+_TITLES_TTL = 3 * 3600
+_titles_cache: tuple[float, list[str]] | None = None
 _RUN_AFTER_HOUR = 10
 _CHECK_INTERVAL = 600
 _UA = (
@@ -58,7 +61,18 @@ async def fetch_hot_titles() -> list[str]:
             except Exception as e:
                 print(f"[meme] 热榜获取失败 {url}: {e}")
     seen: set[str] = set()
-    return [t for t in titles if not (t in seen or seen.add(t))][:120]
+    result = [t for t in titles if not (t in seen or seen.add(t))][:120]
+    if result:
+        global _titles_cache
+        _titles_cache = (time.time(), result)
+    return result
+
+
+async def get_hot_titles() -> list[str]:
+    """热榜标题（3 小时内复用缓存，供说说等其他模块使用）。"""
+    if _titles_cache is not None and time.time() - _titles_cache[0] < _TITLES_TTL:
+        return list(_titles_cache[1])
+    return await fetch_hot_titles()
 
 
 async def run_once() -> list[str]:

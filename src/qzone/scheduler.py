@@ -82,7 +82,7 @@ def _ensure_today_plan(now: datetime) -> dict:
 
 
 async def _fire(slot: dict, websocket: ClientConnection) -> None:
-    event = pick_event()
+    event = await pick_event()
     slot["event"] = event.kind
     try:
         ok = await write_and_post(event, websocket)
