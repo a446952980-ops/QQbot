@@ -13,6 +13,7 @@ import json
 import sqlite3
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +31,7 @@ CREATE TABLE IF NOT EXISTS memes (
     meaning    TEXT    NOT NULL,
     origin     TEXT,
     examples   TEXT    NOT NULL DEFAULT '[]',
+    aliases    TEXT    NOT NULL DEFAULT '[]',
     type       TEXT,
     offense    INTEGER NOT NULL DEFAULT 0,
     scope      TEXT    NOT NULL,
@@ -45,6 +47,20 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+-- 自动学习候选：群里出现、词库未收录的疑似梗
+CREATE TABLE IF NOT EXISTS slang_candidates (
+    group_id      INTEGER NOT NULL,
+    term          TEXT    NOT NULL,
+    kind          TEXT,
+    count         INTEGER NOT NULL DEFAULT 0,
+    speakers      TEXT    NOT NULL DEFAULT '[]',
+    samples       TEXT    NOT NULL DEFAULT '[]',
+    need_count    INTEGER NOT NULL,
+    need_speakers INTEGER NOT NULL,
+    status        TEXT    NOT NULL DEFAULT 'pending',
+    updated_at    INTEGER NOT NULL,
+    PRIMARY KEY (group_id, term)
+);
 """
 
 
@@ -55,6 +71,7 @@ class Meme:
     meaning: str
     origin: str | None
     examples: tuple[str, ...]
+    aliases: tuple[str, ...]
     type: str | None
     offense: bool
     scope: str
@@ -82,7 +99,8 @@ _version = 0  # 每次词条变更 +1，供向量索引判断是否需要刷新
 
 
 def normalize(term: str) -> str:
-    return " ".join(term.split()).lower()
+    """统一全角/半角与大小写、压缩空白。"""
+    return " ".join(unicodedata.normalize("NFKC", term).split()).lower()
 
 
 def _connection() -> sqlite3.Connection:
@@ -94,6 +112,10 @@ def _connection() -> sqlite3.Connection:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(_SCHEMA)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(memes)")}
+        if "aliases" not in columns:  # 旧库迁移
+            conn.execute("ALTER TABLE memes ADD COLUMN aliases TEXT NOT NULL DEFAULT '[]'")
+            conn.commit()
         _conn = conn
         _reload_index()
     return _conn
@@ -104,12 +126,17 @@ def _row_to_meme(row: sqlite3.Row) -> Meme:
         examples = tuple(str(x) for x in json.loads(row["examples"] or "[]"))
     except (TypeError, ValueError):
         examples = ()
+    try:
+        aliases = tuple(str(x) for x in json.loads(row["aliases"] or "[]"))
+    except (TypeError, ValueError):
+        aliases = ()
     return Meme(
         id=row["id"],
         term=row["term"],
         meaning=row["meaning"],
         origin=row["origin"],
         examples=examples,
+        aliases=aliases,
         type=row["type"],
         offense=bool(row["offense"]),
         scope=row["scope"],
@@ -121,9 +148,13 @@ def _reload_index() -> None:
     global _by_term, _max_term_len, _version
     assert _conn is not None
     by_term: dict[str, dict[str, Meme]] = {}
-    for row in _conn.execute("SELECT * FROM memes"):
-        meme = _row_to_meme(row)
+    memes = [_row_to_meme(row) for row in _conn.execute("SELECT * FROM memes")]
+    for meme in memes:
         by_term.setdefault(normalize(meme.term), {})[meme.scope] = meme
+    # 别名（变体写法）后索引：不覆盖同 scope 下的正式词条
+    for meme in memes:
+        for alias in meme.aliases:
+            by_term.setdefault(normalize(alias), {}).setdefault(meme.scope, meme)
     _by_term = by_term
     _max_term_len = max((len(t) for t in by_term), default=0)
     _version += 1
@@ -157,6 +188,15 @@ def resolve(term: str, group_id: int | None) -> Meme | None:
     return scopes.get(GLOBAL_SCOPE)
 
 
+def is_handled(term: str, group_id: int) -> bool:
+    """该词在本群是否已有结论：本群词条（含屏蔽标记）或公共词条存在。"""
+    ensure_loaded()
+    scopes = _by_term.get(normalize(term))
+    if not scopes:
+        return False
+    return str(int(group_id)) in scopes or GLOBAL_SCOPE in scopes
+
+
 def has_term(term: str) -> bool:
     ensure_loaded()
     return normalize(term) in _by_term
@@ -166,9 +206,11 @@ def visible_memes(group_id: int | None) -> list[Meme]:
     """该群可见的全部有效词条（已应用群内覆盖与屏蔽）。"""
     ensure_loaded()
     result: list[Meme] = []
+    seen: set[int] = set()
     for term in _by_term:
         meme = resolve(term, group_id)
-        if meme is not None:
+        if meme is not None and meme.id not in seen:
+            seen.add(meme.id)
             result.append(meme)
     return result
 
@@ -176,7 +218,8 @@ def visible_memes(group_id: int | None) -> list[Meme]:
 def all_active_memes() -> list[Meme]:
     """所有 meaning 非空的词条（向量索引用）。"""
     ensure_loaded()
-    return [m for scopes in _by_term.values() for m in scopes.values() if not m.disabled]
+    unique = {m.id: m for scopes in _by_term.values() for m in scopes.values()}
+    return [m for m in unique.values() if not m.disabled]
 
 
 def write_log(action: str, scope: str, term: str, detail: str = "", operator: str = "") -> None:
@@ -353,3 +396,136 @@ def save_vectors(items: list[tuple[int, bytes]]) -> None:
             [(mid, vec, mid) for mid, vec in items],
         )
         conn.commit()
+
+
+# ---- 自动学习（learn.py 使用） ----
+
+
+def add_learned_meme(
+    scope: str,
+    term: str,
+    meaning: str,
+    *,
+    aliases: list[str],
+    type_: str | None,
+    offense: bool,
+    origin: str | None,
+    examples: list[str],
+    detail: str,
+) -> Meme | None:
+    """写入自动学到的词条；该 scope 下已有同名词条（含人工添加或屏蔽）时不覆盖，返回 None。"""
+    term = " ".join(term.split())
+    with _lock:
+        conn = _connection()
+        if conn.execute(
+            "SELECT 1 FROM memes WHERE term = ? AND scope = ?", (term, scope)
+        ).fetchone():
+            return None
+        conn.execute(
+            "INSERT INTO memes (term, meaning, origin, examples, aliases, type, offense,"
+            " scope, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'auto', ?)",
+            (
+                term,
+                " ".join(meaning.split()),
+                origin,
+                json.dumps(examples[:3], ensure_ascii=False),
+                json.dumps([a for a in aliases if a and a != term][:5], ensure_ascii=False),
+                type_,
+                1 if offense else 0,
+                scope,
+                int(time.time()),
+            ),
+        )
+        conn.commit()
+        _reload_index()
+    write_log("auto_learn", scope, term, detail, "auto")
+    return _by_term[normalize(term)][scope]
+
+
+def get_candidate(group_id: int, term: str) -> dict | None:
+    with _lock:
+        row = _connection().execute(
+            "SELECT * FROM slang_candidates WHERE group_id = ? AND term = ?",
+            (int(group_id), term),
+        ).fetchone()
+    if row is None:
+        return None
+    item = dict(row)
+    item["speakers"] = json.loads(item["speakers"])
+    item["samples"] = json.loads(item["samples"])
+    return item
+
+
+def observe_candidate(
+    group_id: int,
+    term: str,
+    *,
+    kind: str,
+    speaker: str,
+    sample: str,
+    need_count: int,
+    need_speakers: int,
+) -> dict:
+    """记录一次出现：次数 +1、发言人去重（最多 8 个）、保留最近 3 句原话。"""
+    now = int(time.time())
+    with _lock:
+        item = get_candidate(group_id, term)
+        if item is None:
+            item = {
+                "group_id": int(group_id),
+                "term": term,
+                "kind": kind,
+                "count": 0,
+                "speakers": [],
+                "samples": [],
+                "need_count": need_count,
+                "need_speakers": need_speakers,
+                "status": "pending",
+            }
+        item["count"] += 1
+        if speaker and speaker not in item["speakers"]:
+            item["speakers"] = (item["speakers"] + [speaker])[-8:]
+        if sample and sample not in item["samples"]:
+            item["samples"] = (item["samples"] + [sample[:120]])[-3:]
+        save_candidate(item, now=now)
+        return item
+
+
+def save_candidate(item: dict, *, now: int | None = None) -> None:
+    with _lock:
+        conn = _connection()
+        conn.execute(
+            "INSERT OR REPLACE INTO slang_candidates (group_id, term, kind, count, speakers,"
+            " samples, need_count, need_speakers, status, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                item["group_id"],
+                item["term"],
+                item.get("kind"),
+                item["count"],
+                json.dumps(item["speakers"], ensure_ascii=False),
+                json.dumps(item["samples"], ensure_ascii=False),
+                item["need_count"],
+                item["need_speakers"],
+                item["status"],
+                now or int(time.time()),
+            ),
+        )
+        conn.commit()
+
+
+def take_daily_quota(name: str, limit: int) -> bool:
+    """按自然日计数的额度；未超过 limit 时占用一次并返回 True。"""
+    today = time.strftime("%Y-%m-%d")
+    key = f"quota:{name}"
+    with _lock:
+        raw = get_meta(key)
+        try:
+            day, used = (raw or "").split("|")
+            used_n = int(used) if day == today else 0
+        except ValueError:
+            used_n = 0
+        if used_n >= limit:
+            return False
+        set_meta(key, f"{today}|{used_n + 1}")
+        return True

@@ -13,6 +13,7 @@ from ..agent.conversation_history import (
     mark_forward_blocks,
 )
 from ..agent.init_llm import default_group_agent, extract_final_assistant_text
+from ..meme import learn as meme_learn
 from ..meme import service as meme_service
 from ..qq_ws_context import current_qq_websocket
 from .commands import (
@@ -544,6 +545,8 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
                 f"内容: {content_text}"
                 + (f"\n{bg_hint}" if bg_hint else ""),
             )
+            # 自动学习：攒批提取看不懂的说法（后台，不发消息）
+            meme_learn.observe(gid, str(sender_id or ""), _plain_text(segments))
 
         # 群@
         if at_info:
@@ -647,6 +650,9 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
                     _extract_image_urls(segments, "当前消息中的图片")
                 )
                 image_inputs.extend(current_forward_images)
+                meme_learn.observe(
+                    gid, str(sender_id or ""), _plain_text(segments), at_bot=True
+                )
                 meme_hints, meme_suggestion = await meme_service.build_at_context(
                     gid, _plain_text(segments), quoted_plain
                 )

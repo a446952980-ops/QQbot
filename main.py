@@ -17,6 +17,7 @@ from config import (
 from src.handler.dispatcher import handle_event
 from src.scheduler.broadcast import proactive_scheduler_loop
 from src.qzone.scheduler import qzone_scheduler_loop
+from src.meme.hot import hot_loop as meme_hot_loop
 from src.ws_cmd_inject import (
     register_napcat_client_ws,
     serve_tcp_napcat_api_inject,
@@ -122,7 +123,12 @@ async def main():
         print(
             f"定时任务已启用，群: {PROACTIVE_GROUP_IDS}（每天约 00:00 群打卡；08:00 / 19:00 问候）"
         )
-    await connect_to_napcat()
+    # 热榜补充新梗（不依赖 NapCat 连接，进程内常驻）
+    hot_task = asyncio.create_task(meme_hot_loop(), name="meme-hot")
+    try:
+        await connect_to_napcat()
+    finally:
+        hot_task.cancel()
 
 
 if __name__ == "__main__":

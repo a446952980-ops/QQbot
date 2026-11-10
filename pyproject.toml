@@ -11,6 +11,7 @@ dependencies = [
     "langchain>=1.2.15",
     "langchain-openai>=1.1.12",
     "numpy>=2.5.4",
+    "pypinyin>=0.55.0",
     "static-ffmpeg>=3.0",
     "tavily-python>=0.7.23",
     "websockets>=16.0",

@@ -117,6 +117,17 @@ def _env_number(name: str, default, cast):
 MEME_EMBEDDING_DIM = int(_env_number("MEME_EMBEDDING_DIM", 1024, int))
 # 语义兜底命中阈值（余弦相似度）
 MEME_SEMANTIC_THRESHOLD = float(_env_number("MEME_SEMANTIC_THRESHOLD", 0.62, float))
+# 自动学习群内新梗/黑话：每日批量提取与联网查证的次数上限
+MEME_LEARN_ENABLED = (os.getenv("MEME_LEARN_ENABLED") or "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+MEME_EXTRACT_DAILY = int(_env_number("MEME_EXTRACT_DAILY", 200, int))
+MEME_VERIFY_DAILY = int(_env_number("MEME_VERIFY_DAILY", 20, int))
+# 热榜补充新梗：每天最多查证的热榜词数；<=0 关闭
+MEME_HOT_DAILY = int(_env_number("MEME_HOT_DAILY", 10, int))
 # 每隔多少次 @ 回复提供一次“可选化用”的梗；<=0 关闭
 MEME_SUGGEST_EVERY = int(_env_number("MEME_SUGGEST_EVERY", 4, int))
 

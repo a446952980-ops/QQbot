@@ -31,6 +31,11 @@ def _clean(text: str) -> str:
     return " ".join(_NOISE.sub(" ", text or "").split())
 
 
+def _match_line(match: matcher.Match) -> str:
+    note = f"（这里是谐音写法「{match.surface}」）" if match.homophone else ""
+    return _hint_line(match.meme, note)
+
+
 def _hint_line(meme: Meme, note: str = "") -> str:
     line = f"「{meme.term}」{meme.short_meaning()}"
     if meme.offense:
@@ -56,9 +61,9 @@ def annotate_message(group_id: int, text: str) -> str:
     try:
         annotated, _, _ = _annotated_terms(group_id)
         lines = [
-            _hint_line(m)
-            for m in matcher.find_memes(_clean(text), group_id)
-            if m.term not in annotated
+            _match_line(m)
+            for m in matcher.find_matches(_clean(text), group_id)
+            if m.meme.term not in annotated
         ]
         return _block(lines[:_MAX_HINTS])
     except Exception as e:
@@ -82,12 +87,13 @@ async def _build_at_context(
 ) -> tuple[str, str]:
     annotated, peers, own = _annotated_terms(group_id)
     current = _clean(current_text)
-    found: list[Meme] = []
+    matches: list[matcher.Match] = []
     for text in (current, _clean(quoted_text)):
-        for meme in matcher.find_memes(text, group_id):
-            if meme not in found:
-                found.append(meme)
-    lines = [_hint_line(m) for m in found if m.term not in annotated]
+        for match in matcher.find_matches(text, group_id):
+            if all(m.meme.id != match.meme.id for m in matches):
+                matches.append(match)
+    found = [m.meme for m in matches]
+    lines = [_match_line(m) for m in matches if m.meme.term not in annotated]
 
     abbr = await matcher.guess_abbreviations(
         matcher.abbreviation_candidates(current, group_id)
