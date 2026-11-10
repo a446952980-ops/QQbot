@@ -1,4 +1,5 @@
 import asyncio
+import random
 import time
 
 import config
@@ -9,7 +10,7 @@ from typing import Literal
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import ToolCallLimitMiddleware
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langchain.messages import SystemMessage
 
@@ -36,7 +37,9 @@ from .tools import (
     interjection_tools_lst,
     is_music_enabled,
     tools_lst,
+    voice_turn_tools_lst,
 )
+from ..tts.breeze import synthesize_to_mp3 as _breeze_synthesize_to_mp3
 
 _RANDOM_INTERJECTION_PROMPT = """
 现在没有任何人专门对你说话，只是群友们在自己闲聊。这是一次心跳插话：你醒了一下，看一眼群聊，然后决定要不要说点什么、怎么表达。
@@ -90,6 +93,17 @@ R5 · 防复读
 同一会话内，已用于分享的锚点不再作为下一轮插话起点。如果找不到未使用过的锚点，宁可只发 1 条极短反应或沉默，也不要退回无锚点的通用新闻检索。
 """
 
+
+_VOICE_TOOL_NAME = "qq_send_group_msg_voice_breeze"
+# 兜底：模型没调语音工具时，把最终回复转成语音发出的最大字数（太长就留到下一轮）
+_VOICE_FALLBACK_MAX_CHARS = 200
+_VOICE_TURN_HINT = (
+    "【本轮语音】这一轮你要开口说话：至少调用一次 `qq_send_group_msg_voice_breeze` "
+    "把要说的话用语音发出（本轮没有文字单发工具）。text 口语化、1-3 句，"
+    "可在合适位置放 0-2 个官方音频标签（如 [轻笑]、[叹气]）；"
+    "instructions 一定要写，按你此刻真实的情绪写清情境、情绪强度和节奏。"
+    "语音发完后，最终输出只留一句很短的收尾，或不再重复已说的内容。"
+)
 
 _MUSIC_COMPLETED_PROMPT = """
 这是一次「唱完了」的收尾报幕：你刚才在本群用虚拟歌手音色 AI 创作并演唱完了一首歌，
@@ -379,6 +393,27 @@ class QQGroupAgent:
         self._agent_cache: dict[tuple[str, str], object] = {}
         # 思考过程是否以合并转发形式发到群里（/thinking -v 置为静默，仅写 data/thinking.log）
         self._thinking_forward = True
+        # 语音轮次：每群自上次语音后的 @ 回复轮数，与本次随机抽到的目标轮数
+        self._voice_turn_count: dict[int, int] = {}
+        self._voice_turn_target: dict[int, int] = {}
+
+    def _is_voice_turn(self, group_id: int) -> bool:
+        """本群 @ 回复轮次 +1；累计达到随机目标（VOICE_TURN_MIN～MAX）即为语音轮次。"""
+        if config.VOICE_TURN_MAX <= 0:
+            return False
+        count = self._voice_turn_count.get(group_id, 0) + 1
+        self._voice_turn_count[group_id] = count
+        target = self._voice_turn_target.setdefault(
+            group_id, random.randint(config.VOICE_TURN_MIN, config.VOICE_TURN_MAX)
+        )
+        return count >= target
+
+    def _reset_voice_turn(self, group_id: int) -> None:
+        """语音已发出：计数清零并重新抽下一次的目标轮数。"""
+        self._voice_turn_count[group_id] = 0
+        self._voice_turn_target[group_id] = random.randint(
+            config.VOICE_TURN_MIN, config.VOICE_TURN_MAX
+        )
 
     def _group_lock(self, group_id: int) -> asyncio.Lock:
         lock = self._group_locks.get(int(group_id))
@@ -406,19 +441,25 @@ class QQGroupAgent:
             # 常规开启思考：思考过程恢复默认发送（/thinking -v 会在之后单独置为静默）
             self._thinking_forward = True
 
-    def _get_chat_agent(self, prompt_var_name: str, *, vision: bool, music: bool):
+    def _get_chat_agent(
+        self, prompt_var_name: str, *, vision: bool, music: bool, voice: bool = False
+    ):
         """普通 @ 回复 / 定时群发 agent；vision=True 时用视觉模型；
-        music=True 时工具列表含 generate_music（由 /music_on 动态开启，缓存按该维度区分）。"""
+        music=True 时工具列表含 generate_music（由 /music_on 动态开启，缓存按该维度区分）；
+        voice=True 为语音轮次：文字单发工具换成语音工具。"""
         key = (
             prompt_var_name,
-            ("chat_vision" if vision else "chat") + ("_music" if music else ""),
+            ("chat_vision" if vision else "chat")
+            + ("_music" if music else "")
+            + ("_voice" if voice else ""),
         )
         agent = self._agent_cache.get(key)
         if agent is None:
+            base = voice_turn_tools_lst if voice else tools_lst
             tools = (
-                tools_lst
+                base
                 if music
-                else [t for t in tools_lst if t.name != "generate_music"]
+                else [t for t in base if t.name != "generate_music"]
             )
             agent = create_agent(
                 model=self.vision_model if vision else self.model,
@@ -680,6 +721,9 @@ class QQGroupAgent:
         model_content = user_content
         if meme_suggestion:
             model_content += f"\n【可选化用建议（仅本轮可见）】\n{meme_suggestion}\n"
+        voice_turn = self._is_voice_turn(int(group_id))
+        if voice_turn:
+            model_content += "\n" + _VOICE_TURN_HINT + "\n"
         multimodal_content = _build_multimodal_human_content(
             model_content, image_inputs
         )
@@ -694,6 +738,7 @@ class QQGroupAgent:
             get_active_prompt_name(group_id),
             vision=bool(image_inputs),
             music=is_music_enabled(int(group_id)),
+            voice=voice_turn,
         )
         # 供 generate_image 等工具自动获取当前 @ 上下文（参考图 / 群号 / @ 目标），
         # 并标记 @ 流程使 qq_send_group_msg 跳过 background 记录（turn 已含发送文本）
@@ -718,6 +763,9 @@ class QQGroupAgent:
         messages_full = result.get("messages", [])
         # Only this round (exclude re-injected history) so cache is not duplicated.
         suffix = messages_full[len(prior) :]
+        if voice_turn and await self._ensure_voice_sent(group_id, suffix):
+            # 最终回复已转成语音发出，告知调用方不要再发文字
+            result["final_sent_as_voice"] = True
         assistant_combined = build_assistant_combined_for_cache(suffix)
         append_turn(
             group_id,
@@ -727,6 +775,31 @@ class QQGroupAgent:
         )
         self._maybe_trigger_compression(group_id)
         return result
+
+    async def _ensure_voice_sent(self, group_id: int, suffix: list) -> bool:
+        """语音轮次收尾：模型已成功调用语音工具则计数重置；否则把最终回复兜底转语音发出。
+
+        返回 True 表示最终回复已作为语音发出（调用方应跳过文字回复）。
+        兜底失败或回复过长时不重置计数，下一轮继续是语音轮次。"""
+        if any(
+            isinstance(m, ToolMessage)
+            and m.name == _VOICE_TOOL_NAME
+            and str(m.content).strip() == "OK"
+            for m in suffix
+        ):
+            self._reset_voice_turn(int(group_id))
+            return False
+        reply = extract_final_assistant_text(suffix).strip()
+        if not reply or len(reply) > _VOICE_FALLBACK_MAX_CHARS:
+            return False
+        try:
+            mp3_path = await _breeze_synthesize_to_mp3(reply)
+            await interaction.send_group_msg_record(int(group_id), mp3_path)
+        except Exception as e:  # noqa: BLE001
+            print(f"语音轮次兜底发送失败，改发文字: {e}")
+            return False
+        self._reset_voice_turn(int(group_id))
+        return True
 
     async def ainvoke_scheduled_broadcast(
         self,

@@ -70,6 +70,16 @@ TTS_APP_ID = (os.getenv("TTS_APP_ID") or "").strip()
 TTS_ACCESS_TOKEN = (os.getenv("TTS_ACCESS_TOKEN") or "").strip()
 TTS_VOICE_TYPE = (os.getenv("TTS_VOICE_TYPE") or "").strip()
 
+# ---- Breeze Blue TTS（src/tts/breeze.py，qq_send_group_msg_voice_breeze 使用）----
+BREEZE_API_KEY = (os.getenv("BREEZE_API_KEY") or "").strip()
+BREEZE_VOICE_ID = (os.getenv("BREEZE_VOICE_ID") or "voc_zsfm5n3f4uyn").strip()
+BREEZE_BASE_URL = (
+    os.getenv("BREEZE_BASE_URL") or "https://api.breeze.blue"
+).strip().rstrip("/")
+# 可选：不填时默认 breeze-tts-2，文本带音频标签时自动切 breeze-tts-2-multilingual
+BREEZE_TTS_MODEL = (os.getenv("BREEZE_TTS_MODEL") or "").strip()
+BREEZE_LANGUAGE_CODE = (os.getenv("BREEZE_LANGUAGE_CODE") or "zh").strip()
+
 # ---- 生图平台切换（aliyun / volc），key 与模型读环境变量 ----
 IMAGE_GEN_PLATFORM = (os.getenv("IMAGE_GEN_PLATFORM") or "aliyun").strip().lower()
 ARK_API_KEY = (os.getenv("ARK_API_KEY") or "").strip()
@@ -198,3 +208,16 @@ WS_STDIN_CMD = (os.getenv("WS_STDIN_CMD") or "1").strip().lower() not in (
     "no",
     "off",
 )
+
+
+# 有表演指令时的 guidance_scale（官方建议情绪化台词 1～3）与音量倍率（0.01～2）
+BREEZE_GUIDANCE_SCALE = min(max(_env_number("BREEZE_GUIDANCE_SCALE", 2.0, float), 1.0), 10.0)
+BREEZE_VOLUME = min(max(_env_number("BREEZE_VOLUME", 1.0, float), 0.01), 2.0)
+
+
+# ---- 语音轮次：每个群的 @ 回复每隔随机 N 轮（MIN～MAX）必来一次语音 ----
+# 该轮把 qq_send_group_msg 换成 qq_send_group_msg_voice_breeze；MAX<=0 关闭
+VOICE_TURN_MIN = max(int(_env_number("VOICE_TURN_MIN", 5, int)), 1)
+VOICE_TURN_MAX = int(_env_number("VOICE_TURN_MAX", 10, int))
+if 0 < VOICE_TURN_MAX < VOICE_TURN_MIN:
+    VOICE_TURN_MAX = VOICE_TURN_MIN

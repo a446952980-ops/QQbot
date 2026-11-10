@@ -15,7 +15,8 @@ MAX_TURNS = 8
 MAX_BACKGROUND_MESSAGES = 10
 
 _PLAIN_POST_TOOLS = frozenset(
-    {"qq_send_group_msg", "qq_send_group_ai_record", "qq_send_group_emotion_face"}
+    {"qq_send_group_msg", "qq_send_group_ai_record",
+     "qq_send_group_msg_voice_breeze", "qq_send_group_emotion_face"}
 )
 
 _DSML_TOOL_CALLS_RE = re.compile(

@@ -686,7 +686,7 @@ async def _handle_message_inner(event_data: dict, websocket: ClientConnection):
                     )
                     return
                 reply_body = extract_final_assistant_text(result.get("messages", []))
-                if reply_body:
+                if reply_body and not result.get("final_sent_as_voice"):
                     await asyncio.sleep(2)
                     segments = interaction.split_message_segments(reply_body)
                     if len(segments) <= 1:
