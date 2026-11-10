@@ -482,6 +482,9 @@ async def qq_send_qzone_msg(content: str, images: list[str] | None = None) -> st
     except Exception as e:
         return f"Failed: {e}"
     _qzone_quota_consume()
+    from ..qzone.posts import record_post  # 延迟导入：qzone 包依赖本模块
+
+    record_post(content, valid_images, source="agent")
     return "OK"
 
 

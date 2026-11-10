@@ -210,6 +210,25 @@ def history_texts(group_id: int) -> tuple[list[str], list[str]]:
     return user_side, assistant_side
 
 
+def known_group_ids() -> list[int]:
+    """只读：当前有上下文记录的群号。"""
+    with _lock:
+        return sorted(
+            gid for gid in set(_turn_store) | set(_background_store)
+            if _turn_store.get(gid) or _background_store.get(gid)
+        )
+
+
+def user_texts_since(group_id: int, since_ts: int) -> list[str]:
+    """只读：返回该群 since_ts 之后的群友侧文本（background + @ 用户内容），按时间排序。"""
+    with _lock:
+        turns = list(_turn_store.get(group_id) or ())
+        background = list(_background_store.get(group_id) or ())
+    items = [(ts, content) for ts, content in background if ts >= since_ts]
+    items += [(ts, user) for ts, user, _ in turns if ts >= since_ts]
+    return [text for _, text in sorted(items, key=lambda item: item[0])]
+
+
 def _clean_cached_assistant_content(content: str) -> str:
     """Strip internal transcript labels from older persisted assistant turns."""
     content = _DSML_TOOL_CALLS_RE.sub("", content)

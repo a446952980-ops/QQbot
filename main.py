@@ -16,6 +16,7 @@ from config import (
 )
 from src.handler.dispatcher import handle_event
 from src.scheduler.broadcast import proactive_scheduler_loop
+from src.qzone.scheduler import qzone_scheduler_loop
 from src.ws_cmd_inject import (
     register_napcat_client_ws,
     serve_tcp_napcat_api_inject,
@@ -59,6 +60,7 @@ async def connect_to_napcat():
                         )
                     )
                 sched_task = asyncio.create_task(proactive_scheduler_loop(websocket))
+                qzone_task = asyncio.create_task(qzone_scheduler_loop(websocket))
                 try:
                     async for message in websocket:
                         try:
@@ -94,6 +96,11 @@ async def connect_to_napcat():
                     sched_task.cancel()
                     try:
                         await sched_task
+                    except asyncio.CancelledError:
+                        pass
+                    qzone_task.cancel()
+                    try:
+                        await qzone_task
                     except asyncio.CancelledError:
                         pass
                         

@@ -121,6 +121,20 @@ MEME_SEMANTIC_THRESHOLD = float(_env_number("MEME_SEMANTIC_THRESHOLD", 0.62, flo
 MEME_SUGGEST_EVERY = int(_env_number("MEME_SUGGEST_EVERY", 4, int))
 
 
+# ---- 定时说说（src/qzone/）：每天 N 条（1～3），在活跃时段内随机时间发布 ----
+QZONE_AUTO_ENABLED = (os.getenv("QZONE_AUTO_ENABLED") or "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+QZONE_AUTO_DAILY = min(max(int(_env_number("QZONE_AUTO_DAILY", 1, int)), 1), 3)
+# 活跃时段（本地时间，分钟精度），以及两条之间的最小间隔（小时）
+QZONE_AUTO_START = (os.getenv("QZONE_AUTO_START") or "09:00").strip()
+QZONE_AUTO_END = (os.getenv("QZONE_AUTO_END") or "23:30").strip()
+QZONE_AUTO_MIN_GAP_HOURS = float(_env_number("QZONE_AUTO_MIN_GAP_HOURS", 3, float))
+
+
 def _parse_int_list(raw: str) -> list[int]:
     ids: list[int] = []
     for part in raw.replace(";", ",").split(","):
