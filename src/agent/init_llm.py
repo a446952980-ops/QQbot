@@ -148,18 +148,29 @@ def _build_group_at_human_content(
     sender_id: int,
     msg_id: int,
     text: str,
+    event_time: int | None = None,
+    meme_hints: str = "",
 ) -> str:
-    current_time = datetime.now().astimezone().isoformat(timespec="seconds")
-    return (
-        "Context for this @-mention (use these values in tools; do not make up IDs):\n"
-        f"- current_time: {current_time}\n"
-        f"- group_id: {group_id}\n"
-        f"- group_name: {group_name}\n"
-        f"- sender_name: {sender_name}\n"
-        f"- sender_id: {sender_id}\n"
-        f"- msg_id: {msg_id}\n"
-        f"- text: {text}\n"
-    )
+    if event_time is not None:
+        current_time = datetime.fromtimestamp(int(event_time)).astimezone().isoformat(timespec="seconds")
+    else:
+        current_time = datetime.now().astimezone().isoformat(timespec="seconds")
+
+    parts = [
+        f"【群聊 @ 回复 — {sender_name}(QQ:{sender_id}) 对你说】",
+        f"- current_time: {current_time}",
+        f"- group_id: {group_id}",
+        f"- group_name: {group_name}",
+        f"- sender_name: {sender_name}",
+        f"- sender_id: {sender_id}",
+        f"- msg_id: {msg_id}",
+        "",
+        "【对方说的话】",
+        text,
+    ]
+    if meme_hints:
+        parts += ["", "【本次命中的梗（仅供理解，不要原样复读）】", meme_hints]
+    return "\n".join(parts) + "\n"
 
 
 def _build_multimodal_human_content(
@@ -616,6 +627,7 @@ class QQGroupAgent:
         sender_id: int,
         msg_id: int,
         text: str,
+        event_time: int | None = None,
         image_inputs: list[tuple[str, str]] | None = None,
     ) -> list[HumanMessage]:
         user_content = _build_group_at_human_content(
@@ -625,6 +637,7 @@ class QQGroupAgent:
             sender_id=sender_id,
             msg_id=msg_id,
             text=text,
+            event_time=event_time,
         )
         return [
             HumanMessage(content=_build_multimodal_human_content(user_content, image_inputs))
@@ -661,12 +674,12 @@ class QQGroupAgent:
             sender_id=sender_id,
             msg_id=msg_id,
             text=text,
+            event_time=event_time,
+            meme_hints=meme_hints,
         )
-        if meme_hints:
-            user_content += "\n" + meme_hints + "\n"
         model_content = user_content
         if meme_suggestion:
-            model_content += "\n" + meme_suggestion + "\n"
+            model_content += f"\n【可选化用建议（仅本轮可见）】\n{meme_suggestion}\n"
         multimodal_content = _build_multimodal_human_content(
             model_content, image_inputs
         )
