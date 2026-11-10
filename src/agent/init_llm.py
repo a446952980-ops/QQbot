@@ -39,6 +39,7 @@ from .tools import (
     tools_lst,
     voice_turn_tools_lst,
 )
+from ..tts.breeze import ensure_lazy_instructions
 from ..tts.breeze import synthesize_to_mp3 as _breeze_synthesize_to_mp3
 
 _RANDOM_INTERJECTION_PROMPT = """
@@ -101,7 +102,8 @@ _VOICE_TURN_HINT = (
     "【本轮语音】这一轮你要开口说话：至少调用一次 `qq_send_group_msg_voice_breeze` "
     "把要说的话用语音发出（本轮没有文字单发工具）。text 口语化、1-3 句，"
     "可在合适位置放 0-2 个官方音频标签（如 [轻笑]、[叹气]）；"
-    "instructions 一定要写，按你此刻真实的情绪写清情境、情绪强度和节奏。"
+    "instructions 一定要写，必须带「懒散」「懒洋洋」这类词作基调，"
+    "再按你此刻真实的情绪写清情境、情绪强度和节奏。"
     "语音发完后，最终输出只留一句很短的收尾，或不再重复已说的内容。"
 )
 
@@ -793,7 +795,9 @@ class QQGroupAgent:
         if not reply or len(reply) > _VOICE_FALLBACK_MAX_CHARS:
             return False
         try:
-            mp3_path = await _breeze_synthesize_to_mp3(reply)
+            mp3_path = await _breeze_synthesize_to_mp3(
+                reply, instructions=ensure_lazy_instructions("")
+            )
             await interaction.send_group_msg_record(int(group_id), mp3_path)
         except Exception as e:  # noqa: BLE001
             print(f"语音轮次兜底发送失败，改发文字: {e}")

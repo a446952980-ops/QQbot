@@ -21,6 +21,7 @@ from ..action import interaction
 from ..qq_ws_context import current_qq_websocket
 from ..tts.client import synthesize_to_mp3 as _tts_synthesize_to_mp3
 from ..tts.breeze import ZH_AUDIO_TAGS as _BREEZE_ZH_TAGS
+from ..tts.breeze import ensure_lazy_instructions as _breeze_ensure_lazy
 from ..tts.breeze import synthesize_to_mp3 as _breeze_synthesize_to_mp3
 from . import aliyun_image_gen, qq_cover, sonic_music, volces_image_gen
 from .conversation_history import append_background_message
@@ -427,16 +428,19 @@ text：真正说出口的话，口语化、1-3 句，像人说话一样带语气
   只能用这些（方括号，原样照写）：{tags}。
   例："[轻笑]你也太离谱了吧。"、"[叹气]行吧，我认了。"。一句里 0-2 个标签就够，别堆。
   其他括号动作描写会被删掉，不会念出来。
-instructions：中文表演指令，强烈建议填写，决定情绪是否到位。写清 2-3 点：
+instructions：中文表演指令，必填，决定情绪是否到位。必须带上「懒散」「懒洋洋」「慵懒」这类词
+  作为整体基调（缺了会被自动在开头补上），再在此基础上写清 2-3 点：
   情境/意图（在安慰人、在调侃、装生气其实在笑）、情绪及强度（"轻微不耐烦"、"压着笑"、
   "委屈但不哭"）、节奏与重音（"慢一点，'真的'两个字咬重"）、身体状态（"刚睡醒、有点含糊"）。
-  不要改变音色身份，不要写具体秒数。例："像被朋友逗笑后假装嫌弃，语速轻快，尾音上扬。"
+  不要改变音色身份，不要写具体秒数。
+  例："懒洋洋地，像被朋友逗笑后假装嫌弃，压着笑，尾音拖长上扬。"
+      "慵懒、懒散，刚睡醒有点含糊，语速放慢，带点不耐烦。"
 speed：可选语速倍率 0.5-2.0（默认 1.0）；慵懒/难过可 0.9，激动/急可 1.15，别走极端。
 
 Args:
     group_id: QQ group ID.
     text: 要说出口的文字（可含官方音频标签）。
-    instructions: 中文表演指令（情境、情绪强度、节奏、身体状态）。
+    instructions: 中文表演指令，必须含懒散/懒洋洋类词汇，再写情境、情绪强度、节奏。
     speed: 语速倍率，0.5-2.0。
 """.format(tags="、".join(f"[{t}]" for t in _BREEZE_ZH_TAGS))
 
@@ -445,7 +449,7 @@ Args:
 async def qq_send_group_msg_voice_breeze(
     group_id: int,
     text: str,
-    instructions: str | None = None,
+    instructions: str,
     speed: float | None = None,
 ) -> str:
     """Breeze TTS 合成语音并发到群（说明见 _VOICE_BREEZE_TOOL_DESCRIPTION）。"""
@@ -454,7 +458,9 @@ async def qq_send_group_msg_voice_breeze(
         return "Failed: 未提供要朗读的文字。"
     try:
         mp3_path = await _breeze_synthesize_to_mp3(
-            text, instructions=instructions, speed=speed
+            text,
+            instructions=_breeze_ensure_lazy(instructions),
+            speed=speed,
         )
     except Exception as e:
         return f"Failed: 语音合成失败 {e}"

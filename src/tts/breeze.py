@@ -51,6 +51,23 @@ _EMOJI_RE = re.compile(
 )
 
 
+# 人设基调：语音表演指令必须带「懒散/懒洋洋」一类词，缺了就由代码补上
+LAZY_KEYWORDS: tuple[str, ...] = (
+    "懒散", "懒洋洋", "慵懒", "懒懒", "懒懒散散", "懒得", "提不起劲", "没睡醒",
+)
+_LAZY_PREFIX = "整体懒洋洋、懒散的语气"
+
+
+def ensure_lazy_instructions(instructions: str | None) -> str:
+    """保证表演指令里有懒散类词汇；没有则在开头补「整体懒洋洋、懒散的语气」。"""
+    instructions = (instructions or "").strip()
+    if any(k in instructions for k in LAZY_KEYWORDS):
+        return instructions
+    if not instructions:
+        return _LAZY_PREFIX + "，随口说出来。"
+    return f"{_LAZY_PREFIX}，{instructions}"
+
+
 def normalize_text(text: str) -> tuple[str, bool]:
     """清洗朗读文本：去 markdown/链接/emoji；括号动作映射为官方标签，其余括号内容删掉。
 
